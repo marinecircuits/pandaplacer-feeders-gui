@@ -126,6 +126,7 @@ class FeederMapApp:
         self.show_disabled = tk.BooleanVar(value=True)
 
         self.small = tkfont.Font(family="TkDefaultFont", size=8)
+        self.label = tkfont.Font(family="TkDefaultFont", size=10, weight="bold")
         self.mono = tkfont.Font(family="TkFixedFont", size=10)
 
         self._build_toolbar()
@@ -293,9 +294,28 @@ class FeederMapApp:
         item = c.create_rectangle(sx - m, sy - m, sx + m, sy + m,
                                   fill=color, outline=outline, width=width)
         self.items[item] = f
-        # short label = trailing token of the name (e.g. N205)
+
+        # slot-number label box, placed on the outboard side of the bed so the
+        # markers stay in clean columns and labels sit in the margin.
         label = f.name.split("-")[-1] if "-" in f.name else f.name
-        c.create_text(sx, sy, text=label, fill="#11121a", font=self.small)
+        xmin, _, xmax, _ = self.bed
+        on_left = f.x < (xmin + xmax) / 2
+        gap = 6
+        lw = self.label.measure(label) + 12
+        lh = self.label.metrics("linespace") + 6
+        if on_left:
+            lx1 = sx - m - gap
+            lx0 = lx1 - lw
+        else:
+            lx0 = sx + m + gap
+            lx1 = lx0 + lw
+        box = c.create_rectangle(lx0, sy - lh / 2, lx1, sy + lh / 2,
+                                 fill="#11121a", outline=color, width=width)
+        txt = c.create_text((lx0 + lx1) / 2, sy, text=label,
+                            fill=self.COL_TEXT, font=self.label)
+        # make the label box select the same feeder on hover/click
+        self.items[box] = f
+        self.items[txt] = f
 
     # -- interaction ------------------------------------------------------ #
     def _feeder_at(self, x, y) -> Feeder | None:
