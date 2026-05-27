@@ -6,6 +6,9 @@ __pycache__/
 venv/
 env/
 
+# Vendored third-party tool (kept locally, not part of this repo)
+PPBFC_AS_Feeder_Test_Tool-V1.1/
+
 # OS / editor
 .DS_Store
 *.swp
