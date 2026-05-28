@@ -1,14 +1,15 @@
-# Bambu Feeder Map
+# PandaPlacer Bamboo Feeders
 
-A small Tkinter app that reads your OpenPnP `machine.xml` and draws a top-down
-map of where every **Bambu feeder** (`BambooFeederAutoVision`) sits on the
-machine bed.
+A small Tkinter app to **view and edit** the **Bamboo feeders**
+(`BambooFeederAutoVision`) in your OpenPnP `machine.xml`. It draws a top-down
+map of where every feeder sits on the machine bed, and lets you add, move,
+remove, re-part, enable/disable and set the tape rotation of feeders.
 
 ## Run
 
 ```bash
-python3 feeder_map.py                 # reads ~/.openpnp2/machine.xml
-python3 feeder_map.py /path/machine.xml
+python3 pandaplacer_feeders.py                 # reads ~/.openpnp2/machine.xml
+python3 pandaplacer_feeders.py /path/machine.xml
 ```
 
 No dependencies beyond the Python standard library (Tkinter ships with Python).
@@ -48,8 +49,53 @@ that name already exists. Pick a **Part** (dropdown of `parts.xml` ids) and
 
 The new feeder clones the vision pipeline and settings from a feeder in the
 same bank (preferring an enabled one), gets a fresh unique id, and is inserted
-into the `<feeders>` container. Banks are discovered from the data, so the four
-current banks are:
+into the `<feeders>` container.
+
+### Tape rotation is remembered / auto-applied
+
+When you pick a part, the dialog decides the new feeder's tape orientation
+(`rotation-in-feeder`) for you and shows it in the preview (and again in the
+confirmation after adding):
+
+1. **Remembered** — if that part is in `tape_orientations.json` (see below),
+   that value is reused. The preview reads *"remembered"*.
+2. **Auto 0603/0805 R/C** — otherwise, 0603 and 0805 resistors and capacitors
+   (part ids containing `R0603`/`C0603`/`R0805`/`C0805`) default to **−90°**.
+   Inductors (`L_0603`) and other 0603-sized parts (`0603_LED`) are excluded.
+3. Otherwise the clone keeps the template feeder's own value.
+
+A remembered orientation always wins over the −90° default, so a part you once
+configured differently keeps that orientation.
+
+#### The orientation map (`tape_orientations.json`)
+
+Preferred orientations live in a simple JSON file — a flat `part-id → rotation`
+map:
+
+```json
+{
+  "R_0603_1608Metric-10k_0603": "90",
+  "SOT-23-3-BSS138": "180"
+}
+```
+
+It is stored in the shared PandaPlacer per-user config folder the app creates
+inside the OS config directory (so it survives moving/updating the script).
+This folder is general — other PandaPlacer configs may live here too:
+
+| OS            | Path |
+|---------------|------|
+| Linux / Unix  | `$XDG_CONFIG_HOME/pandaplacer-feeders-gui/` (default `~/.config/pandaplacer-feeders-gui/`) |
+| macOS         | `~/Library/Application Support/pandaplacer-feeders-gui/` |
+| Windows       | `%APPDATA%\pandaplacer-feeders-gui\` |
+
+It is updated automatically whenever an orientation is applied — both when a
+feeder is **added** (the resolved value, including the −90° R/C default) and
+when you **⟲ Set tape rotation** on a feeder. You can also edit it by hand; it
+is written sorted for clean diffs. Entries persist even after the feeder is
+removed, so re-adding the same part reuses its orientation.
+
+Banks are discovered from the data, so the four current banks are:
 
 | Slot | Side  | Ports     | X (mm) | Y at port 0 → 12 |
 |------|-------|-----------|--------|------------------|
@@ -75,6 +121,16 @@ already-used target slots are flagged for confirmation.
 Select a feeder and click **🏷 Set part** to reassign its associated part from
 the `parts.xml` dropdown (prefilled with the current part). Only the feeder's
 `part-id` is changed.
+
+## Changing the tape rotation
+
+Select a feeder and click **⟲ Tape rotation** to edit the part's orientation
+in the tape (`rotation-in-feeder`, separate from the pick location's rotation).
+The dialog has a combobox of common values (`-90 / 0 / 90 / 180 / 270`); any
+numeric value is accepted. Only the `rotation-in-feeder` attribute is
+rewritten; the rest of the feeder block is left untouched. The chosen
+orientation is also saved to `tape_orientations.json` so future feeders for the
+same part reuse it.
 
 ## Removing a feeder
 
