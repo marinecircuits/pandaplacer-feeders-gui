@@ -6,8 +6,8 @@ __pycache__/
 venv/
 env/
 
-# Vendored third-party tool (kept locally, not part of this repo)
-PPBFC_AS_Feeder_Test_Tool-V1.1/
+# Config backups written before edits
+config_backups/
 
 # OS / editor
 .DS_Store
