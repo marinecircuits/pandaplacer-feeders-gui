@@ -1,6 +1,6 @@
-# PandaPlacer Bambu Feeders
+# PandaPlacer Bamboo Feeders
 
-A small Tkinter app to **view and edit** the **Bambu feeders**
+A small Tkinter app to **view and edit** the **Bamboo feeders**
 (`BambooFeederAutoVision`) in your OpenPnP `machine.xml`. It draws a top-down
 map of where every feeder sits on the machine bed, and lets you add, move,
 remove, re-part, enable/disable and set the tape rotation of feeders.

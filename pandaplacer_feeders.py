@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""PandaPlacer Bambu feeders — view and edit OpenPnP feeders.
+"""PandaPlacer Bamboo feeders — view and edit OpenPnP feeders.
 
-Reads an OpenPnP machine.xml and draws a top-down map of where every Bambu
+Reads an OpenPnP machine.xml and draws a top-down map of where every Bamboo
 feeder (BambooFeederAutoVision) sits on the machine bed, colour-coded by
 whether it is enabled and which part it carries, and lets you add, move,
 remove, re-part, enable/disable and set the tape rotation of feeders.
@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
-BAMBU_CLASS = "org.openpnp.machine.pandaplacer.BambooFeederAutoVision"
+BAMBOO_CLASS = "org.openpnp.machine.pandaplacer.BambooFeederAutoVision"
 DEFAULT_CONFIG = os.path.expanduser("~/.openpnp2/machine.xml")
 
 # Config backups written here (next to this script) before any edit.
@@ -106,7 +106,7 @@ def parse_config(path: str) -> tuple[list[Feeder], tuple[float, float, float, fl
 
     feeders: list[Feeder] = []
     for f in root.iter("feeder"):
-        if BAMBU_CLASS not in f.get("class", ""):
+        if BAMBOO_CLASS not in f.get("class", ""):
             continue
         loc = f.find("location")
         if loc is None:
@@ -591,7 +591,7 @@ class FeederMapApp:
         self.selected: Feeder | None = None
 
         self.root = tk.Tk()
-        self.root.title(f"PandaPlacer — Bambu Feeders  [{config_path}]")
+        self.root.title(f"PandaPlacer — Bamboo Feeders  [{config_path}]")
         self.root.geometry("1180x820")
         self.root.configure(bg=self.COL_BG)
 
@@ -1665,7 +1665,7 @@ class RotationHelpDialog(tk.Toplevel):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="View and edit OpenPnP Bambu feeders.")
+        description="View and edit OpenPnP Bamboo feeders.")
     ap.add_argument("config", nargs="?", default=DEFAULT_CONFIG,
                     help=f"path to machine.xml (default: {DEFAULT_CONFIG})")
     args = ap.parse_args(argv)
