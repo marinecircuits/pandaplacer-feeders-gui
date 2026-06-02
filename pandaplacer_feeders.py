@@ -1177,26 +1177,10 @@ class FeederMapApp:
         SettingsDialog(self)
 
     def perform_feed_selected(self):
-        """Actuate the selected feeder over serial using its slot + advance."""
+        """Actuate the selected feeder over serial using its configured advance."""
         f = self.selected
         if f is None or self._feeding:
             return
-        port = self.settings.get("serial_port")
-        if not port:
-            messagebox.showerror(
-                "No serial port",
-                "No serial port is configured. Open ⚙ Settings and choose the "
-                "feeder controller's port first.")
-            return
-        baud = int(self.settings.get("baud", DEFAULT_BAUD))
-        slot = parse_slot(f.name)
-        if slot is None:
-            messagebox.showerror(
-                "Unknown slot",
-                f"Can't determine a feeder slot (port N) from the name "
-                f"'{f.name}', so the feed command can't be addressed.")
-            return
-        slot_n = slot[0] * 100 + slot[1]
         advance_mm = advance_mm_from_actuator(f.post_pick_actuator)
         if advance_mm is None:
             messagebox.showerror(
@@ -1205,23 +1189,75 @@ class FeederMapApp:
                 "isn't an AutoFeeder_<N>mmAdvance). Set it via double-click → "
                 "Edit feeder first.")
             return
+
+        def on_start():
+            self.feed_btn.config(state="disabled", text="▶ Feeding…")
+            self.status.config(text=f"Feeding '{f.name}'…")
+
+        def on_progress(cmd):
+            self.status.config(text=f"Feeding '{f.name}'…  → {cmd}")
+
+        def on_done(name, slot_n, mm, err):
+            self.feed_btn.config(
+                text="▶ Perform feed",
+                state="normal" if self.selected else "disabled")
+            if err is None:
+                self.status.config(
+                    text=f"Fed '{name}'  ·  N{slot_n}  ·  {mm} mm")
+            else:
+                messagebox.showerror("Feed failed", str(err))
+                self.status.config(text=f"Feed failed: {err}")
+
+        self.feed_feeder(f, advance_mm, on_start=on_start,
+                         on_progress=on_progress, on_done=on_done)
+
+    def feed_feeder(self, feeder, advance_mm, *, parent=None, on_start=None,
+                    on_progress=None, on_done=None) -> bool:
+        """Validate, confirm (once per session) and run a serial feed of
+        `advance_mm` for `feeder` on a background thread.
+
+        Shared by the toolbar Perform feed button and the Edit dialog's manual
+        feed buttons. The optional callbacks all run on the main thread:
+        on_start(), on_progress(cmd), on_done(name, slot_n, advance_mm, err).
+        Returns True if the feed was started, False if blocked or declined.
+        """
+        if feeder is None or self._feeding:
+            return False
+        parent = parent or self.root
+        port = self.settings.get("serial_port")
+        if not port:
+            messagebox.showerror(
+                "No serial port",
+                "No serial port is configured. Open ⚙ Settings and choose the "
+                "feeder controller's port first.", parent=parent)
+            return False
+        baud = int(self.settings.get("baud", DEFAULT_BAUD))
+        slot = parse_slot(feeder.name)
+        if slot is None:
+            messagebox.showerror(
+                "Unknown slot",
+                f"Can't determine a feeder slot (port N) from the name "
+                f"'{feeder.name}', so the feed command can't be addressed.",
+                parent=parent)
+            return False
+        slot_n = slot[0] * 100 + slot[1]
         # Warn before the first physical feed; once confirmed, don't ask again
         # for the rest of the session.
         if not self._feed_confirmed:
             if not messagebox.askyesno(
                 "Perform feed",
-                f"Feed '{f.name}' now?\n\n"
+                f"Feed '{feeder.name}' now?\n\n"
                 f"Port N : {slot_n}\n"
                 f"Advance: {advance_mm} mm\n"
                 f"Serial : {port} @ {baud} baud\n\n"
                 "⚠ The feeder will physically advance the tape.\n"
-                "(Shown only once per session — later feeds run immediately.)"):
-                return
+                "(Shown only once per session — later feeds run immediately.)",
+                parent=parent):
+                return False
             self._feed_confirmed = True
         self._feeding = True
-        self.feed_btn.config(state="disabled", text="▶ Feeding…")
-        self.status.config(text=f"Feeding '{f.name}' (N{slot_n}, "
-                                f"{advance_mm} mm) on {port}…")
+        if on_start:
+            on_start()
 
         # Run serial I/O off the GUI thread. The worker only mutates `result`
         # (never Tk); the main thread polls it via after(), so every widget
@@ -1238,28 +1274,21 @@ class FeederMapApp:
             result["done"] = True
 
         threading.Thread(target=worker, daemon=True).start()
-        self._poll_feed(result, f.name, slot_n, advance_mm)
+        self._poll_feed(result, feeder.name, slot_n, advance_mm,
+                        on_progress, on_done)
+        return True
 
-    def _poll_feed(self, result, name, slot_n, advance_mm):
+    def _poll_feed(self, result, name, slot_n, advance_mm, on_progress,
+                   on_done):
         if not result.get("done"):
-            last = result.get("last")
-            if last:
-                self.status.config(text=f"Feeding '{name}'…  → {last}")
+            if on_progress and result.get("last"):
+                on_progress(result["last"])
             self.root.after(80, self._poll_feed, result, name, slot_n,
-                            advance_mm)
+                            advance_mm, on_progress, on_done)
             return
-        self._feed_done(name, slot_n, advance_mm, result.get("err"))
-
-    def _feed_done(self, name, slot_n, advance_mm, err):
         self._feeding = False
-        self.feed_btn.config(text="▶ Perform feed",
-                             state="normal" if self.selected else "disabled")
-        if err is None:
-            self.status.config(
-                text=f"Fed '{name}'  ·  N{slot_n}  ·  {advance_mm} mm")
-        else:
-            messagebox.showerror("Feed failed", str(err))
-            self.status.config(text=f"Feed failed: {err}")
+        if on_done:
+            on_done(name, slot_n, advance_mm, result.get("err"))
 
     def edit_feeder(self, feeder: Feeder, *, reposition: bool, bank: int,
                     port: int, part: str, enabled: bool,
@@ -1410,8 +1439,7 @@ class FeederMapApp:
             ("X", f"{f.x:.2f} mm"),
             ("Y", f"{f.y:.2f} mm"),
             ("Z", f"{f.z:.2f} mm"),
-            ("Rotation", f"{f.rotation:.2f}°"),
-            ("Tape rot.", tape_rot),
+            ("Rotation in tape", tape_rot),
             None,
             ("Advance", advance),
             ("Move feed", "yes" if f.move_before_feed else "no"),
@@ -1612,7 +1640,7 @@ class AddFeederDialog(tk.Toplevel):
             self.add_btn.config(state="disabled")
             return
         model = self.app.models[bank]
-        x, y, z, rot = model.position(port)
+        x, y, z, _ = model.position(port)
         name = slot_name(bank, port)
         warns = []
         if self._unreachable(x, y):
@@ -1640,7 +1668,6 @@ class AddFeederDialog(tk.Toplevel):
                   f"X    : {x:.2f} mm\n"
                   f"Y    : {y:.2f} mm\n"
                   f"Z    : {z:.2f} mm\n"
-                  f"Rot  : {rot:.2f}°\n"
                   f"{tape_line}\n"
                   f"{adv_line}\n"
                   f"Act  : {act}  (feed + post-pick)\n"
@@ -1750,8 +1777,8 @@ class EditFeederDialog(tk.Toplevel):
                        activebackground=app.COL_BG, activeforeground=app.COL_TEXT
                        ).grid(row=3, column=1, sticky="w", **pad)
 
-        # Tape rotation
-        label(4, "Tape rotation (°)")
+        # Rotation in tape
+        label(4, "Rotation in tape (°)")
         rot_row = tk.Frame(frm, bg=app.COL_BG)
         rot_row.grid(row=4, column=1, sticky="w", **pad)
         self.rot_var = tk.StringVar(value=feeder.rotation_in_feeder or "0")
@@ -1780,13 +1807,28 @@ class EditFeederDialog(tk.Toplevel):
             activebackground=app.COL_BG, activeforeground=app.COL_TEXT
         ).grid(row=6, column=1, sticky="w", **pad)
 
+        # Manual feed — physically advance this feeder's tape now over serial,
+        # independent of the saved Tape advance above.
+        label(7, "Manual feed")
+        feed_row = tk.Frame(frm, bg=app.COL_BG)
+        feed_row.grid(row=7, column=1, sticky="w", **pad)
+        self._manual_btns = []
+        for mm in (4, 8, 12):
+            b = tk.Button(feed_row, text=f"{mm} mm",
+                          command=lambda mm=mm: self._manual_feed(mm))
+            b.pack(side="left", padx=(0, 6))
+            self._manual_btns.append(b)
+        self.feed_status = tk.Label(frm, text="", bg=app.COL_BG, fg=app.COL_KEY,
+                                    font=app.small, anchor="w", justify="left")
+        self.feed_status.grid(row=8, column=1, sticky="w", padx=10)
+
         # Position preview (only meaningful when the slot is changed)
         self.preview = tk.Label(frm, text="", bg=app.COL_BED, fg=app.COL_TEXT,
                                 justify="left", anchor="w", font=app.mono)
-        self.preview.grid(row=7, column=0, columnspan=2, sticky="we", **pad)
+        self.preview.grid(row=9, column=0, columnspan=2, sticky="we", **pad)
 
         btns = tk.Frame(frm, bg=app.COL_BG)
-        btns.grid(row=8, column=0, columnspan=2, sticky="e", **pad)
+        btns.grid(row=10, column=0, columnspan=2, sticky="e", **pad)
         tk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
         tk.Button(btns, text="Save", command=self._save).pack(
             side="right", padx=(0, 8))
@@ -1800,6 +1842,39 @@ class EditFeederDialog(tk.Toplevel):
             return int(self.bank_var.get()), int(self.port_var.get())
         except (ValueError, AttributeError):
             return None, None
+
+    def _manual_feed(self, mm):
+        """Physically feed this feeder `mm` now (shares the app's feed core)."""
+        def alive():
+            try:
+                return bool(self.winfo_exists())
+            except tk.TclError:
+                return False
+
+        def on_start():
+            if alive():
+                for b in self._manual_btns:
+                    b.config(state="disabled")
+                self.feed_status.config(text=f"Feeding {mm} mm…")
+
+        def on_progress(cmd):
+            if alive():
+                self.feed_status.config(text=f"→ {cmd}")
+
+        def on_done(name, slot_n, advance_mm, err):
+            if alive():
+                for b in self._manual_btns:
+                    b.config(state="normal")
+                self.feed_status.config(
+                    text=(f"Fed {advance_mm} mm (N{slot_n})." if err is None
+                          else f"Feed failed: {err}"))
+                if err is not None:
+                    messagebox.showerror("Feed failed", str(err), parent=self)
+            elif err is not None:
+                messagebox.showerror("Feed failed", str(err))
+
+        self.app.feed_feeder(self.feeder, mm, parent=self, on_start=on_start,
+                             on_progress=on_progress, on_done=on_done)
 
     def _will_reposition(self) -> bool:
         return self.has_slots and \
@@ -1823,14 +1898,14 @@ class EditFeederDialog(tk.Toplevel):
         if bank is None or bank not in self.app.models:
             self.preview.config(text="select a valid slot")
             return
-        x, y, z, rot = self.app.models[bank].position(port)
+        x, y, z, _ = self.app.models[bank].position(port)
         name = slot_name(bank, port)
         warn = "\n⚠ outside machine travel — NOT reachable." \
             if self._unreachable(x, y) else ""
         self.preview.config(
             text=(f"Will move to {name}\n"
                   f"X : {x:.2f} mm   Y : {y:.2f} mm\n"
-                  f"Z : {z:.2f} mm   Rot : {rot:.2f}°{warn}"))
+                  f"Z : {z:.2f} mm{warn}"))
 
     def _save(self):
         raw_rot = self.rot_var.get().strip()
@@ -1839,7 +1914,7 @@ class EditFeederDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror(
                 "Invalid value",
-                f"Tape rotation '{raw_rot}' is not a number.", parent=self)
+                f"Rotation in tape '{raw_rot}' is not a number.", parent=self)
             return
         m = re.match(r"\s*(\d+)", self.adv_var.get())
         if not m:
