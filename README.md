@@ -18,14 +18,20 @@ No dependencies beyond the Python standard library (Tkinter ships with Python).
 
 - The bed rectangle is sized from the X/Y axis soft limits in the config
   (here 318 × 343 mm), with a 50 mm grid and the `0,0` origin marked.
-- Each feeder is a square at its real X/Y, labelled with the tail of its name
-  (e.g. `N205`). Colours:
+- Each feeder is a square at its real X/Y, labelled with its slot number
+  zero-padded to 3 digits (e.g. `N000`, `N011`, `N205`). The number is drawn
+  next to the marker — on the right of the label for left-side feeders, on the
+  left for right-side ones — so the numbers line up against the bed, with the
+  part id (if any) on the other side. Colours:
   - **green** — enabled and has a part assigned
   - **amber** — enabled but no part (`NC`)
   - **grey** — disabled
-- **Hover** a feeder to see its details; **click** to pin them in the side panel.
-- **Double-click** a feeder to toggle it enabled/disabled (writes to the config,
-  with the same backup / OpenPnP-closed rules as the other edits).
+- **Hover** a feeder to see its details; **click** to pin them in the side
+  panel. The detail panel is a two-column grid (name/part, position & rotation,
+  tape advance & move-before-feed, feed count, id) that stays aligned in any
+  font.
+- **Double-click** a feeder to open the **Edit feeder** dialog and change all
+  its properties at once (see *Editing a feeder*).
 - **Filter** box matches feeder name or part id.
 - **Show disabled** toggles the (many) disabled reserve slots.
 - **⟳ Reload** re-reads the config after you change it in OpenPnP.
@@ -91,9 +97,33 @@ This folder is general — other PandaPlacer configs may live here too:
 
 It is updated automatically whenever an orientation is applied — both when a
 feeder is **added** (the resolved value, including the −90° R/C default) and
-when you **⟲ Set tape rotation** on a feeder. You can also edit it by hand; it
-is written sorted for clean diffs. Entries persist even after the feeder is
-removed, so re-adding the same part reuses its orientation.
+when you set the tape rotation in the **Edit feeder** dialog. You can also edit
+it by hand; it is written sorted for clean diffs. Entries persist even after the
+feeder is removed, so re-adding the same part reuses its orientation.
+
+### Actuator value follows the slot
+
+Each Bamboo auto-feeder is addressed by its **slot number** — the number in the
+`PPBF-N<num>` name (`bank*100 + port`). So both `feed-actuator-value` and
+`post-pick-actuator-value` are set to that number when a feeder is added (e.g.
+`PPBF-N305` → `305.0`, `PPBF-N7` → `7.0`), instead of inheriting the cloned
+template's slot. The Add preview shows the value as `Act : …`. The actuator
+*names* (`AutoFeeder_4mm/8mm/12mmAdvance`) depend on the tape width, not the
+slot, so they are kept as cloned.
+
+### Tape advance is remembered / auto-applied
+
+The tape **advance** — how far the tape steps after a pick — is the
+`post-pick-actuator-name` (`AutoFeeder_4mm/8mm/12mmAdvance`, from the
+`AutoFeeder_<N>mmAdvance` actuators the machine defines). Like the tape
+rotation it is a property of the part's tape, so it is remembered per part in
+`tape_advances.json` (a sibling of `tape_orientations.json`, a flat
+`part-id → advance-mm` map) and auto-applied when you add a feeder for that
+part. The Add preview shows it as `Adv : … mm (remembered)`; if the part has no
+remembered advance, the cloned template's advance is kept (`(template
+default)`). It is saved/updated whenever you set the advance in the **Edit
+feeder** dialog (see *Editing a feeder*) or add a feeder for a part with a
+remembered value.
 
 Banks are discovered from the data, so the four current banks are:
 
@@ -109,28 +139,34 @@ position falls outside the machine travel (the X/Y soft limits — e.g. the
 bottom slots `N111/N112` and `N200/N201` at Y < 0) is flagged as **not
 reachable by the head**, and you're asked to confirm before adding it.
 
-## Moving a feeder
+## Editing a feeder
 
-Select a feeder and click **⇄ Move selected**. Pick a new slot (bank) + feeder
-(port); the feeder is repositioned onto that preset and renamed to match
-(`PPBF-N…`), keeping its id, part, pipeline and enabled state. Unreachable or
-already-used target slots are flagged for confirmation.
+**Double-click** a feeder to open **Edit feeder** — the one place to change
+every editable property. All fields are applied together in a single backup and
+write:
 
-## Changing the part
-
-Select a feeder and click **🏷 Set part** to reassign its associated part from
-the `parts.xml` dropdown (prefilled with the current part). Only the feeder's
-`part-id` is changed.
-
-## Changing the tape rotation
-
-Select a feeder and click **⟲ Tape rotation** to edit the part's orientation
-in the tape (`rotation-in-feeder`, separate from the pick location's rotation).
-The dialog has a combobox of common values (`-90 / 0 / 90 / 180 / 270`); any
-numeric value is accepted. Only the `rotation-in-feeder` attribute is
-rewritten; the rest of the feeder block is left untouched. The chosen
-orientation is also saved to `tape_orientations.json` so future feeders for the
-same part reuse it.
+- **Slot** (bank / port) — the position is only rewritten if you actually
+  change the slot. Leaving it alone keeps the feeder's exact (possibly
+  calibrated) X/Y; changing it repositions and renames to the new preset
+  (`PPBF-N…`) and updates the actuator value to the new slot number (see
+  *Actuator value follows the slot*), so a moved feeder drives the right
+  physical feeder. Unreachable or already-used target slots are flagged for
+  confirmation. If there are no bank presets, every field except the slot is
+  still editable.
+- **Part** — reassign from the `parts.xml` dropdown (prefilled with the
+  current part). Type to filter the list.
+- **Enabled** — enable/disable the feeder.
+- **Tape rotation** — the part's orientation in the tape (`rotation-in-feeder`,
+  separate from the pick location's rotation). A combobox of common values
+  (`-90 / 0 / 90 / 180 / 270`); any numeric value is accepted, and a **?**
+  button opens a visual guide. The chosen orientation is saved to
+  `tape_orientations.json` so future feeders for the same part reuse it.
+- **Tape advance** — a dropdown of the advance distances the machine defines
+  (`2 / 4 / 8 / 12 mm`, read from its `AutoFeeder_<N>mmAdvance` actuators). This
+  rewrites `post-pick-actuator-name`; the post-pick value (the slot number) is
+  left untouched. The chosen advance is saved to `tape_advances.json` so future
+  feeders for the same part reuse it.
+- **Move to feeder before feeding** — the `move-before-feed` attribute.
 
 ## Removing a feeder
 
