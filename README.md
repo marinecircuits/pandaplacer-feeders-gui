@@ -3,7 +3,8 @@
 A small Tkinter app to **view and edit** the **Bamboo feeders**
 (`BambooFeederAutoVision`) in your OpenPnP `machine.xml`. It draws a top-down
 map of where every feeder sits on the machine bed, and lets you add, move,
-remove, re-part, enable/disable and set the tape rotation of feeders.
+remove, re-part, enable/disable, set the tape rotation/advance of feeders, and
+**actuate a feeder over serial** to perform a feed.
 
 ## Run
 
@@ -12,7 +13,11 @@ python3 pandaplacer_feeders.py                 # reads ~/.openpnp2/machine.xml
 python3 pandaplacer_feeders.py /path/machine.xml
 ```
 
-No dependencies beyond the Python standard library (Tkinter ships with Python).
+Viewing and editing the config needs only the Python standard library (Tkinter
+ships with Python). The **Perform feed** feature additionally needs
+[`pyserial`](https://pypi.org/project/pyserial/) to talk to the feeder
+controller — install it with `pip install pyserial`. Without it the rest of the
+app still works; only the feed button reports that pyserial is missing.
 
 ## What you see
 
@@ -27,16 +32,16 @@ No dependencies beyond the Python standard library (Tkinter ships with Python).
   - **amber** — enabled but no part (`NC`)
   - **grey** — disabled
 - **Hover** a feeder to see its details; **click** to pin them in the side
-  panel. The detail panel is a two-column grid (name/part, position & rotation,
-  tape advance & move-before-feed, feed count, id) that stays aligned in any
-  font.
+  panel. The detail panel is a two-column grid (name/part, position, rotation
+  in tape, tape advance & move-before-feed, feed count, id) that stays aligned
+  in any font.
 - **Double-click** a feeder to open the **Edit feeder** dialog and change all
   its properties at once (see *Editing a feeder*).
 - **Filter** box matches feeder name or part id.
 - **Show disabled** toggles the (many) disabled reserve slots.
 - **⟳ Reload** re-reads the config after you change it in OpenPnP.
 
-The current config has two banks: the left column (`PPBF-N0…N112`) and the
+The current config has two banks: the left column (`PPBF-N000…N112`) and the
 right column (`PPBF-N200…N312`), each stacked along Y.
 
 ## Adding a feeder (preset by slot + feeder number)
@@ -106,7 +111,7 @@ feeder is removed, so re-adding the same part reuses its orientation.
 Each Bamboo auto-feeder is addressed by its **slot number** — the number in the
 `PPBF-N<num>` name (`bank*100 + port`). So both `feed-actuator-value` and
 `post-pick-actuator-value` are set to that number when a feeder is added (e.g.
-`PPBF-N305` → `305.0`, `PPBF-N7` → `7.0`), instead of inheriting the cloned
+`PPBF-N305` → `305.0`, `PPBF-N007` → `7.0`), instead of inheriting the cloned
 template's slot. The Add preview shows the value as `Act : …`. The actuator
 *names* (`AutoFeeder_4mm/8mm/12mmAdvance`) depend on the tape width, not the
 slot, so they are kept as cloned.
@@ -129,7 +134,7 @@ Banks are discovered from the data, so the four current banks are:
 
 | Slot | Side  | Ports     | X (mm) | Y at port 0 → 12 |
 |------|-------|-----------|--------|------------------|
-| 0    | left  | N0–N12    | 11.30  | 291.40 → 141.40 (−12.5/port) |
+| 0    | left  | N000–N012 | 11.30  | 291.40 → 141.40 (−12.5/port) |
 | 1    | left  | N100–N112 | 11.30  | 126.60 → −23.40 (−12.5/port) |
 | 2    | right | N200–N212 | 307.20 | −21.00 → 129.00 (+12.5/port) |
 | 3    | right | N300–N312 | 307.20 | 144.00 → 294.00 (+12.5/port) |
@@ -156,17 +161,60 @@ write:
 - **Part** — reassign from the `parts.xml` dropdown (prefilled with the
   current part). Type to filter the list.
 - **Enabled** — enable/disable the feeder.
-- **Tape rotation** — the part's orientation in the tape (`rotation-in-feeder`,
-  separate from the pick location's rotation). A combobox of common values
-  (`-90 / 0 / 90 / 180 / 270`); any numeric value is accepted, and a **?**
-  button opens a visual guide. The chosen orientation is saved to
-  `tape_orientations.json` so future feeders for the same part reuse it.
+- **Rotation in tape** — the part's orientation in the tape pocket
+  (`rotation-in-feeder`). A combobox of common values (`-90 / 0 / 90 / 180 /
+  270`); any numeric value is accepted, and a **?** button opens a visual
+  guide. The chosen orientation is saved to `tape_orientations.json` so future
+  feeders for the same part reuse it.
 - **Tape advance** — a dropdown of the advance distances the machine defines
   (`2 / 4 / 8 / 12 mm`, read from its `AutoFeeder_<N>mmAdvance` actuators). This
   rewrites `post-pick-actuator-name`; the post-pick value (the slot number) is
   left untouched. The chosen advance is saved to `tape_advances.json` so future
   feeders for the same part reuse it.
 - **Move to feeder before feeding** — the `move-before-feed` attribute.
+- **Manual feed** — `4 / 8 / 12 mm` buttons that physically advance this
+  feeder's tape *now* over serial by the chosen distance, independent of the
+  saved tape advance (handy for threading a tape or testing). They use the
+  configured serial port and the same safety confirmation as *Perform feed*.
+
+## Performing a feed (serial)
+
+Select a feeder and click **▶ Perform feed** to physically actuate it through
+the PPBFC AS feeder controller over a serial port. The command is addressed and
+sized from the feeder itself:
+
+- **Port N** = the feeder's slot number (`bank*100 + port`, the number in its
+  name and its actuator value).
+- **Advance** = the feeder's tape advance in mm (from `post-pick-actuator-name`).
+
+After you confirm, the app opens the configured serial port, sends the feed
+sequence, then closes the port. The sequence mirrors the *PPBFC AS Feeder Test
+Tool*'s Activate + Single Advance:
+
+```
+M610 S1                 ; enable controller
+M611 S0                 ; deactivate all ports
+M611 N<slot> S1         ; activate this port
+M600 N<slot> F<mm> X1   ; advance <mm> mm
+M611 N<slot> S0         ; deactivate this port
+```
+
+The serial I/O runs off the UI thread, and the status bar shows progress and
+the result. You'll get a clear message if the port isn't configured, the
+feeder has no tape advance set, the slot can't be determined from the name, or
+`pyserial` isn't installed.
+
+The **Edit feeder** dialog also has **Manual feed** `4 / 8 / 12 mm` buttons that
+feed by a chosen distance regardless of the saved advance — useful for threading
+a tape or testing a slot.
+
+## Settings
+
+Click **⚙ Settings** to choose the **serial port** and **baud** (default
+`19200`) used by *Perform feed*. The port dropdown lists detected serial ports
+but is editable, so you can type a device path that isn't auto-detected (e.g.
+`/dev/ttyUSB0`, `COM3`). Settings are saved to `settings.json` in the same
+per-user config folder as the orientation/advance maps.
 
 ## Removing a feeder
 

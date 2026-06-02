@@ -4,7 +4,8 @@
 Reads an OpenPnP machine.xml and draws a top-down map of where every Bamboo
 feeder (BambooFeederAutoVision) sits on the machine bed, colour-coded by
 whether it is enabled and which part it carries, and lets you add, move,
-remove, re-part, enable/disable and set the tape rotation of feeders.
+remove, re-part, enable/disable and set the tape rotation/advance of feeders.
+It can also actuate a feeder over serial (via pyserial) to perform a feed.
 
 Usage:
     python3 pandaplacer_feeders.py [path/to/machine.xml]
@@ -21,6 +22,8 @@ import os
 import re
 import shutil
 import sys
+import threading
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
@@ -78,6 +81,11 @@ ORIENTATIONS_FILE = os.path.join(default_config_dir(), "tape_orientations.json")
 # when adding a feeder and updated whenever a tape advance is applied, so a
 # part's tape pitch is remembered across configs.
 ADVANCES_FILE = os.path.join(default_config_dir(), "tape_advances.json")
+
+# General app settings (serial port, baud, …) live in a small JSON file in the
+# same per-user config folder.
+SETTINGS_FILE = os.path.join(default_config_dir(), "settings.json")
+DEFAULT_BAUD = 19200
 
 # Default bed size (mm) used only if the axis soft limits can't be read.
 FALLBACK_BED = (318.0, 343.0)
@@ -589,6 +597,87 @@ def resolve_advance(part: str,
 
 
 # --------------------------------------------------------------------------- #
+# General settings + serial auto-feeder actuation
+# --------------------------------------------------------------------------- #
+# Actuating a feeder talks to the PPBFC AS feeder controller over a serial
+# port. The protocol mirrors the PPBFC AS Feeder Test Tool: each port is
+# addressed by its slot number N (= bank*100 + port, the same number used for
+# the feeder name and actuator value), and a feed is a short g-code sequence.
+# pyserial is imported lazily so the rest of the app still runs without it.
+
+
+def load_settings(path: str = SETTINGS_FILE) -> dict:
+    """Read general app settings (empty dict if missing/invalid)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(settings: dict, path: str = SETTINGS_FILE) -> None:
+    """Write general app settings, creating the config dir if needed."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def list_serial_ports() -> list[str]:
+    """Available serial port device names (empty list if pyserial is absent)."""
+    try:
+        import serial.tools.list_ports as list_ports
+    except ImportError:
+        return []
+    return [p.device for p in list_ports.comports()]
+
+
+def feed_command_sequence(slot_n: int, advance_mm: int) -> list[str]:
+    """The g-code lines that feed one auto-feeder port once.
+
+    Mirrors the PPBFC AS Feeder Test Tool's Activate + Single Advance: enable
+    the controller, deactivate all ports, activate port N, advance F mm, then
+    deactivate port N again.
+    """
+    return [
+        "M610 S1",                              # enable controller
+        "M611 S0",                              # deactivate all ports
+        f"M611 N{slot_n} S1",                   # activate this port
+        f"M600 N{slot_n} F{advance_mm} X1",     # advance F mm
+        f"M611 N{slot_n} S0",                   # deactivate this port
+    ]
+
+
+def perform_feed(port: str, baud: int, slot_n: int, advance_mm: int, *,
+                 log=None, settle_s: float = 0.3, delay_s: float = 0.2,
+                 sleep_fn=time.sleep) -> None:
+    """Open `port`, send the feed sequence for `slot_n`, then close it.
+
+    Raises ImportError if pyserial is missing, or serial.SerialException (and
+    other OSError subclasses) if the port can't be opened/written. `log(text)`,
+    if given, receives one entry per line sent.
+    """
+    try:
+        import serial
+    except ImportError as exc:                  # pragma: no cover - env-specific
+        raise ImportError(
+            "pyserial is required to actuate feeders — install it with "
+            "'pip install pyserial'.") from exc
+    emit = log or (lambda _text: None)
+    ser = serial.Serial(port, baud, timeout=5)
+    try:
+        sleep_fn(settle_s)                      # let the controller come up
+        for cmd in feed_command_sequence(slot_n, advance_mm):
+            ser.write((cmd + "\n").encode("utf-8"))
+            ser.flush()
+            emit(cmd)
+            sleep_fn(delay_s)
+    finally:
+        ser.close()
+
+
+# --------------------------------------------------------------------------- #
 # Bank / slot model (preset positions derived from existing feeders)
 # --------------------------------------------------------------------------- #
 NAME_RE = re.compile(r"PPBF-N(\d+)")
@@ -750,6 +839,21 @@ def derive_bank_models(feeders: list[Feeder]) -> dict[int, BankModel]:
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
+def grab_when_visible(win: tk.Toplevel) -> None:
+    """Make `win` modal once it is actually mapped.
+
+    Calling grab_set() straight from a Toplevel's __init__ races the window
+    manager: the window often isn't viewable yet, raising
+    'grab failed: window not viewable'. Retry on the event loop until it is
+    viewable (or the window is gone)."""
+    try:
+        if not win.winfo_exists():
+            return
+        win.grab_set()
+    except tk.TclError:
+        win.after(20, lambda: grab_when_visible(win))
+
+
 class FeederMapApp:
     PAD = 60          # canvas padding (px) around the bed
     MARKER = 9        # feeder marker half-size (px)
@@ -771,10 +875,13 @@ class FeederMapApp:
         self.models: dict[int, BankModel] = {}
         self.orientations: dict[str, str] = {}
         self.advances: dict[str, int] = {}
+        self.settings: dict = load_settings()
         self.bed = (0.0, 0.0, *FALLBACK_BED)
         self.items: dict[int, Feeder] = {}     # canvas item id -> feeder
         self.selected: Feeder | None = None
         self._detail_for: object = object()    # feeder currently in the panel
+        self._feeding = False                  # a serial feed is in progress
+        self._feed_confirmed = False           # feed warning shown once/session
 
         self.root = tk.Tk()
         self.root.title(f"PandaPlacer — Bamboo Feeders  [{config_path}]")
@@ -803,9 +910,16 @@ class FeederMapApp:
                   command=self.add_feeder_dialog).pack(side="left", padx=(8, 0))
         # Per-property editing now lives in the double-click Edit feeder dialog;
         # the toolbar keeps only what that dialog doesn't cover.
+        self.feed_btn = tk.Button(bar, text="▶ Perform feed",
+                                  command=self.perform_feed_selected,
+                                  state="disabled")
+        self.feed_btn.pack(side="left", padx=(8, 0))
         self.remove_btn = tk.Button(bar, text="🗑 Remove selected",
                                     command=self.remove_selected, state="disabled")
         self.remove_btn.pack(side="left", padx=(8, 0))
+        tk.Button(bar, text="⚙ Settings",
+                  command=self.open_settings_dialog).pack(side="left",
+                                                          padx=(8, 0))
         tk.Checkbutton(
             bar, text="Show disabled", variable=self.show_disabled,
             command=self.redraw, bg=self.COL_BG, fg=self.COL_TEXT,
@@ -880,7 +994,11 @@ class FeederMapApp:
         self.redraw()
 
     def _set_selection_buttons(self, enabled: bool):
-        self.remove_btn.config(state="normal" if enabled else "disabled")
+        state = "normal" if enabled else "disabled"
+        self.remove_btn.config(state=state)
+        # don't re-enable the feed button mid-feed
+        if not self._feeding:
+            self.feed_btn.config(state=state)
 
     # -- coordinate transform --------------------------------------------- #
     def _make_transform(self):
@@ -1070,6 +1188,123 @@ class FeederMapApp:
         self.status.config(
             text=f"Removed '{f.name}'  ·  backup: {os.path.basename(backup)}")
 
+    def open_settings_dialog(self):
+        SettingsDialog(self)
+
+    def perform_feed_selected(self):
+        """Actuate the selected feeder over serial using its configured advance."""
+        f = self.selected
+        if f is None or self._feeding:
+            return
+        advance_mm = advance_mm_from_actuator(f.post_pick_actuator)
+        if advance_mm is None:
+            messagebox.showerror(
+                "No tape advance",
+                f"'{f.name}' has no tape advance set (post-pick-actuator-name "
+                "isn't an AutoFeeder_<N>mmAdvance). Set it via double-click → "
+                "Edit feeder first.")
+            return
+
+        def on_start():
+            self.feed_btn.config(state="disabled", text="▶ Feeding…")
+            self.status.config(text=f"Feeding '{f.name}'…")
+
+        def on_progress(cmd):
+            self.status.config(text=f"Feeding '{f.name}'…  → {cmd}")
+
+        def on_done(name, slot_n, mm, err):
+            self.feed_btn.config(
+                text="▶ Perform feed",
+                state="normal" if self.selected else "disabled")
+            if err is None:
+                self.status.config(
+                    text=f"Fed '{name}'  ·  N{slot_n}  ·  {mm} mm")
+            else:
+                messagebox.showerror("Feed failed", str(err))
+                self.status.config(text=f"Feed failed: {err}")
+
+        self.feed_feeder(f, advance_mm, on_start=on_start,
+                         on_progress=on_progress, on_done=on_done)
+
+    def feed_feeder(self, feeder, advance_mm, *, parent=None, on_start=None,
+                    on_progress=None, on_done=None) -> bool:
+        """Validate, confirm (once per session) and run a serial feed of
+        `advance_mm` for `feeder` on a background thread.
+
+        Shared by the toolbar Perform feed button and the Edit dialog's manual
+        feed buttons. The optional callbacks all run on the main thread:
+        on_start(), on_progress(cmd), on_done(name, slot_n, advance_mm, err).
+        Returns True if the feed was started, False if blocked or declined.
+        """
+        if feeder is None or self._feeding:
+            return False
+        parent = parent or self.root
+        port = self.settings.get("serial_port")
+        if not port:
+            messagebox.showerror(
+                "No serial port",
+                "No serial port is configured. Open ⚙ Settings and choose the "
+                "feeder controller's port first.", parent=parent)
+            return False
+        baud = int(self.settings.get("baud", DEFAULT_BAUD))
+        slot = parse_slot(feeder.name)
+        if slot is None:
+            messagebox.showerror(
+                "Unknown slot",
+                f"Can't determine a feeder slot (port N) from the name "
+                f"'{feeder.name}', so the feed command can't be addressed.",
+                parent=parent)
+            return False
+        slot_n = slot[0] * 100 + slot[1]
+        # Warn before the first physical feed; once confirmed, don't ask again
+        # for the rest of the session.
+        if not self._feed_confirmed:
+            if not messagebox.askyesno(
+                "Perform feed",
+                f"Feed '{feeder.name}' now?\n\n"
+                f"Port N : {slot_n}\n"
+                f"Advance: {advance_mm} mm\n"
+                f"Serial : {port} @ {baud} baud\n\n"
+                "⚠ The feeder will physically advance the tape.\n"
+                "(Shown only once per session — later feeds run immediately.)",
+                parent=parent):
+                return False
+            self._feed_confirmed = True
+        self._feeding = True
+        if on_start:
+            on_start()
+
+        # Run serial I/O off the GUI thread. The worker only mutates `result`
+        # (never Tk); the main thread polls it via after(), so every widget
+        # update happens on the main thread.
+        result: dict = {}
+
+        def worker():
+            try:
+                perform_feed(port, baud, slot_n, advance_mm,
+                             log=lambda c: result.__setitem__("last", c))
+                result["err"] = None
+            except Exception as exc:        # noqa: BLE001 - surface any failure
+                result["err"] = exc
+            result["done"] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_feed(result, feeder.name, slot_n, advance_mm,
+                        on_progress, on_done)
+        return True
+
+    def _poll_feed(self, result, name, slot_n, advance_mm, on_progress,
+                   on_done):
+        if not result.get("done"):
+            if on_progress and result.get("last"):
+                on_progress(result["last"])
+            self.root.after(80, self._poll_feed, result, name, slot_n,
+                            advance_mm, on_progress, on_done)
+            return
+        self._feeding = False
+        if on_done:
+            on_done(name, slot_n, advance_mm, result.get("err"))
+
     def edit_feeder(self, feeder: Feeder, *, reposition: bool, bank: int,
                     port: int, part: str, enabled: bool,
                     rotation_in_feeder: float, advance_mm: int,
@@ -1219,8 +1454,7 @@ class FeederMapApp:
             ("X", f"{f.x:.2f} mm"),
             ("Y", f"{f.y:.2f} mm"),
             ("Z", f"{f.z:.2f} mm"),
-            ("Rotation", f"{f.rotation:.2f}°"),
-            ("Tape rot.", tape_rot),
+            ("Rotation in tape", tape_rot),
             None,
             ("Advance", advance),
             ("Move feed", "yes" if f.move_before_feed else "no"),
@@ -1394,7 +1628,7 @@ class AddFeederDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         self.bank_var.set(banks[0])
         self.port_var.set("0")
-        self.grab_set()
+        grab_when_visible(self)
 
     # current (bank, port) or (None, None) if incomplete
     def _selection(self):
@@ -1421,7 +1655,7 @@ class AddFeederDialog(tk.Toplevel):
             self.add_btn.config(state="disabled")
             return
         model = self.app.models[bank]
-        x, y, z, rot = model.position(port)
+        x, y, z, _ = model.position(port)
         name = slot_name(bank, port)
         warns = []
         if self._unreachable(x, y):
@@ -1449,7 +1683,6 @@ class AddFeederDialog(tk.Toplevel):
                   f"X    : {x:.2f} mm\n"
                   f"Y    : {y:.2f} mm\n"
                   f"Z    : {z:.2f} mm\n"
-                  f"Rot  : {rot:.2f}°\n"
                   f"{tape_line}\n"
                   f"{adv_line}\n"
                   f"Act  : {act}  (feed + post-pick)\n"
@@ -1559,8 +1792,8 @@ class EditFeederDialog(tk.Toplevel):
                        activebackground=app.COL_BG, activeforeground=app.COL_TEXT
                        ).grid(row=3, column=1, sticky="w", **pad)
 
-        # Tape rotation
-        label(4, "Tape rotation (°)")
+        # Rotation in tape
+        label(4, "Rotation in tape (°)")
         rot_row = tk.Frame(frm, bg=app.COL_BG)
         rot_row.grid(row=4, column=1, sticky="w", **pad)
         self.rot_var = tk.StringVar(value=feeder.rotation_in_feeder or "0")
@@ -1589,26 +1822,74 @@ class EditFeederDialog(tk.Toplevel):
             activebackground=app.COL_BG, activeforeground=app.COL_TEXT
         ).grid(row=6, column=1, sticky="w", **pad)
 
+        # Manual feed — physically advance this feeder's tape now over serial,
+        # independent of the saved Tape advance above.
+        label(7, "Manual feed")
+        feed_row = tk.Frame(frm, bg=app.COL_BG)
+        feed_row.grid(row=7, column=1, sticky="w", **pad)
+        self._manual_btns = []
+        for mm in (4, 8, 12):
+            b = tk.Button(feed_row, text=f"{mm} mm",
+                          command=lambda mm=mm: self._manual_feed(mm))
+            b.pack(side="left", padx=(0, 6))
+            self._manual_btns.append(b)
+        self.feed_status = tk.Label(frm, text="", bg=app.COL_BG, fg=app.COL_KEY,
+                                    font=app.small, anchor="w", justify="left")
+        self.feed_status.grid(row=8, column=1, sticky="w", padx=10)
+
         # Position preview (only meaningful when the slot is changed)
         self.preview = tk.Label(frm, text="", bg=app.COL_BED, fg=app.COL_TEXT,
                                 justify="left", anchor="w", font=app.mono)
-        self.preview.grid(row=7, column=0, columnspan=2, sticky="we", **pad)
+        self.preview.grid(row=9, column=0, columnspan=2, sticky="we", **pad)
 
         btns = tk.Frame(frm, bg=app.COL_BG)
-        btns.grid(row=8, column=0, columnspan=2, sticky="e", **pad)
+        btns.grid(row=10, column=0, columnspan=2, sticky="e", **pad)
         tk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
         tk.Button(btns, text="Save", command=self._save).pack(
             side="right", padx=(0, 8))
 
         self.bind("<Escape>", lambda e: self.destroy())
         self._update_preview()
-        self.grab_set()
+        grab_when_visible(self)
 
     def _selection(self):
         try:
             return int(self.bank_var.get()), int(self.port_var.get())
         except (ValueError, AttributeError):
             return None, None
+
+    def _manual_feed(self, mm):
+        """Physically feed this feeder `mm` now (shares the app's feed core)."""
+        def alive():
+            try:
+                return bool(self.winfo_exists())
+            except tk.TclError:
+                return False
+
+        def on_start():
+            if alive():
+                for b in self._manual_btns:
+                    b.config(state="disabled")
+                self.feed_status.config(text=f"Feeding {mm} mm…")
+
+        def on_progress(cmd):
+            if alive():
+                self.feed_status.config(text=f"→ {cmd}")
+
+        def on_done(name, slot_n, advance_mm, err):
+            if alive():
+                for b in self._manual_btns:
+                    b.config(state="normal")
+                self.feed_status.config(
+                    text=(f"Fed {advance_mm} mm (N{slot_n})." if err is None
+                          else f"Feed failed: {err}"))
+                if err is not None:
+                    messagebox.showerror("Feed failed", str(err), parent=self)
+            elif err is not None:
+                messagebox.showerror("Feed failed", str(err))
+
+        self.app.feed_feeder(self.feeder, mm, parent=self, on_start=on_start,
+                             on_progress=on_progress, on_done=on_done)
 
     def _will_reposition(self) -> bool:
         return self.has_slots and \
@@ -1632,14 +1913,14 @@ class EditFeederDialog(tk.Toplevel):
         if bank is None or bank not in self.app.models:
             self.preview.config(text="select a valid slot")
             return
-        x, y, z, rot = self.app.models[bank].position(port)
+        x, y, z, _ = self.app.models[bank].position(port)
         name = slot_name(bank, port)
         warn = "\n⚠ outside machine travel — NOT reachable." \
             if self._unreachable(x, y) else ""
         self.preview.config(
             text=(f"Will move to {name}\n"
                   f"X : {x:.2f} mm   Y : {y:.2f} mm\n"
-                  f"Z : {z:.2f} mm   Rot : {rot:.2f}°{warn}"))
+                  f"Z : {z:.2f} mm{warn}"))
 
     def _save(self):
         raw_rot = self.rot_var.get().strip()
@@ -1648,7 +1929,7 @@ class EditFeederDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror(
                 "Invalid value",
-                f"Tape rotation '{raw_rot}' is not a number.", parent=self)
+                f"Rotation in tape '{raw_rot}' is not a number.", parent=self)
             return
         m = re.match(r"\s*(\d+)", self.adv_var.get())
         if not m:
@@ -1686,27 +1967,103 @@ class EditFeederDialog(tk.Toplevel):
             move_before_feed=self.move_var.get())
 
 
-class RotationHelpDialog(tk.Toplevel):
-    """Visual guide: how to read 'rotation in tape' from a CAD/tape pair.
+class SettingsDialog(tk.Toplevel):
+    """Configure the serial port + baud used to actuate feeders.
 
-    Follows OpenPnP's EIA-481 convention: tape 0° is sprocket holes on top,
-    + is CCW, − is CW. The value is the part's rotation in the tape pocket
-    relative to its upright orientation in the E-CAD library footprint.
+    The port dropdown lists the system's serial ports (via pyserial) but is
+    editable, so a port that isn't auto-detected can be typed in. Settings are
+    persisted to settings.json in the per-user config folder.
     """
 
-    # Each row: (rotation°, one-line caption explaining what the user sees)
-    EXAMPLES = (
-        (0,    "Part sits in the tape the same way as in CAD."),
-        (-90,  "Part rotated 90° clockwise in the tape (pin 1 → top-right)."),
-        (180,  "Part rotated 180° in the tape (pin 1 → bottom-right)."),
-        (90,   "Part rotated 90° counter-clockwise (pin 1 → bottom-left)."),
-    )
+    BAUDS = ("4800", "9600", "19200", "38400", "57600", "115200")
 
-    BODY_W = 28          # half-width of the chip in px
-    BODY_H = 18          # half-height of the chip in px
+    def __init__(self, app: "FeederMapApp"):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Settings")
+        self.configure(bg=app.COL_BG)
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.minsize(420, 0)
+
+        pad = {"padx": 10, "pady": 8}
+        frm = tk.Frame(self, bg=app.COL_BG)
+        frm.pack(fill="both", expand=True, padx=8, pady=8)
+        frm.columnconfigure(1, weight=1)
+
+        tk.Label(frm, text="Feeder controller serial port", bg=app.COL_BG,
+                 fg=app.COL_TEXT, font=("TkDefaultFont", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky="w", **pad)
+
+        tk.Label(frm, text="Port", bg=app.COL_BG, fg=app.COL_TEXT).grid(
+            row=1, column=0, sticky="e", **pad)
+        self.port_var = tk.StringVar(value=app.settings.get("serial_port", ""))
+        self.port_cb = ttk.Combobox(frm, textvariable=self.port_var,
+                                    values=list_serial_ports(), width=26)
+        self.port_cb.grid(row=1, column=1, sticky="we", **pad)
+        tk.Button(frm, text="⟳", width=2, command=self._refresh_ports).grid(
+            row=1, column=2, sticky="w", padx=(0, 10))
+
+        tk.Label(frm, text="Baud", bg=app.COL_BG, fg=app.COL_TEXT).grid(
+            row=2, column=0, sticky="e", **pad)
+        self.baud_var = tk.StringVar(
+            value=str(app.settings.get("baud", DEFAULT_BAUD)))
+        ttk.Combobox(frm, textvariable=self.baud_var, values=self.BAUDS,
+                     width=12).grid(row=2, column=1, sticky="w", **pad)
+
+        tk.Label(frm, text="Not listed? Type the device path "
+                           "(e.g. /dev/ttyUSB0, COM3).",
+                 bg=app.COL_BG, fg=app.COL_KEY, font=app.small).grid(
+                     row=3, column=0, columnspan=3, sticky="w", **pad)
+
+        btns = tk.Frame(frm, bg=app.COL_BG)
+        btns.grid(row=4, column=0, columnspan=3, sticky="e", **pad)
+        tk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        tk.Button(btns, text="Save", command=self._save).pack(
+            side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        grab_when_visible(self)
+
+    def _refresh_ports(self):
+        self.port_cb["values"] = list_serial_ports()
+
+    def _save(self):
+        port = self.port_var.get().strip()
+        raw = self.baud_var.get().strip()
+        try:
+            baud = int(raw)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid baud", f"'{raw}' is not a number.", parent=self)
+            return
+        self.app.settings["serial_port"] = port
+        self.app.settings["baud"] = baud
+        try:
+            save_settings(self.app.settings)
+        except Exception as exc:           # noqa: BLE001 - surface any failure
+            messagebox.showerror("Save failed", str(exc), parent=self)
+            return
+        self.destroy()
+        self.app.status.config(
+            text=f"Settings saved  ·  port {port or '—'} @ {baud}")
+
+
+class RotationHelpDialog(tk.Toplevel):
+    """Matrix guide for the 'rotation in tape' value.
+
+    Rows = the part's rotation in the CAD library; columns = how it appears in
+    the tape (sprocket holes on top, EIA-481). Each cell is the value to enter:
+    rotation-in-feeder = tape − CAD (CCW positive), normalised to (−180°, 180°].
+    """
+
+    ANGLES = (0, 90, 180, 270)     # measured CCW from the upright orientation
+
+    BODY_W = 17          # half-width of the chip body (px)
+    BODY_H = 11          # half-height of the chip body (px)
     DOT_R = 3            # pin-1 dot radius
-    CANVAS_W = 110
-    CANVAS_H = 80
+    CELL_W = 74          # header chip canvas width (px)
+    CELL_H = 54          # header chip canvas height (px)
 
     def __init__(self, app: "FeederMapApp", parent: tk.Toplevel | None = None):
         super().__init__(parent if parent is not None else app.root)
@@ -1716,54 +2073,57 @@ class RotationHelpDialog(tk.Toplevel):
         self.transient(parent if parent is not None else app.root)
         self.resizable(False, False)
 
-        pad = {"padx": 12, "pady": 6}
         intro = (
-            "Rotation in tape = how the part is turned inside the tape pocket,\n"
-            "measured against its upright orientation in your CAD library.\n"
-            "\n"
-            "  1. View the part upright in CAD — pin 1 / pol. mark = ●.\n"
-            "  2. View the tape with sprocket holes on TOP (EIA-481).\n"
-            "  3. The angle from CAD-upright → tape orientation is the value.\n"
-            "     Positive = CCW, negative = CW."
+            "Find the part's rotation in your CAD library (row) and how it sits "
+            "in the tape\n(column — sprocket holes on top, EIA-481). The cell is "
+            "the Rotation-in-tape value\nto enter.   ● = pin 1 / polarity mark."
         )
         tk.Label(self, text=intro, bg=app.COL_BG, fg=app.COL_TEXT,
                  justify="left", anchor="w", font=app.mono).pack(
-                     anchor="w", **pad)
+                     anchor="w", padx=12, pady=(10, 6))
 
-        # header row
         grid = tk.Frame(self, bg=app.COL_BG)
-        grid.pack(fill="x", padx=12, pady=(2, 4))
-        for col, text in enumerate(("CAD (library)", "", "Tape", "Enter")):
-            tk.Label(grid, text=text, bg=app.COL_BG, fg=app.COL_TEXT,
-                     font=("TkDefaultFont", 10, "bold")).grid(
-                         row=0, column=col, padx=8, pady=(0, 4))
+        grid.pack(padx=12, pady=4)
 
-        for r, (rot, caption) in enumerate(self.EXAMPLES, start=1):
-            cad = tk.Canvas(grid, width=self.CANVAS_W, height=self.CANVAS_H,
-                            bg=app.COL_BED, highlightthickness=0)
-            cad.grid(row=r, column=0, padx=8, pady=4)
-            self._draw_chip(cad, rot=0, with_sprocket=False)
+        # corner cell
+        tk.Label(grid, text="CAD ↓\nTape →", bg=app.COL_BED, fg=app.COL_TEXT,
+                 font=("TkDefaultFont", 9, "bold"), justify="center").grid(
+                     row=0, column=0, sticky="nsew", padx=1, pady=1)
 
-            tk.Label(grid, text="→", bg=app.COL_BG, fg=app.COL_TEXT,
-                     font=("TkDefaultFont", 14)).grid(
-                         row=r, column=1, padx=4)
+        # column headers — how the part appears in the tape
+        for j, tape in enumerate(self.ANGLES):
+            cell = tk.Frame(grid, bg=app.COL_BED)
+            cell.grid(row=0, column=j + 1, sticky="nsew", padx=1, pady=1)
+            cv = tk.Canvas(cell, width=self.CELL_W, height=self.CELL_H,
+                           bg=app.COL_BED, highlightthickness=0)
+            cv.pack()
+            self._draw_chip(cv, rot=tape, with_sprocket=True)
+            tk.Label(cell, text=f"{tape}°", bg=app.COL_BED, fg=app.COL_TEXT,
+                     font=("TkDefaultFont", 9, "bold")).pack()
 
-            tape = tk.Canvas(grid, width=self.CANVAS_W, height=self.CANVAS_H,
-                             bg=app.COL_BED, highlightthickness=0)
-            tape.grid(row=r, column=2, padx=8, pady=4)
-            self._draw_chip(tape, rot=rot, with_sprocket=True)
+        # rows — CAD-library orientation header + the value cells
+        for i, cad in enumerate(self.ANGLES):
+            hdr = tk.Frame(grid, bg=app.COL_BED)
+            hdr.grid(row=i + 1, column=0, sticky="nsew", padx=1, pady=1)
+            cv = tk.Canvas(hdr, width=self.CELL_W, height=self.CELL_H,
+                           bg=app.COL_BED, highlightthickness=0)
+            cv.pack()
+            self._draw_chip(cv, rot=cad, with_sprocket=False)
+            tk.Label(hdr, text=f"{cad}°", bg=app.COL_BED, fg=app.COL_TEXT,
+                     font=("TkDefaultFont", 9, "bold")).pack()
 
-            tk.Label(grid, text=f"{rot:+d}°", bg=app.COL_BG, fg=app.COL_SEL,
-                     font=("TkDefaultFont", 12, "bold")).grid(
-                         row=r, column=3, padx=8)
-            tk.Label(grid, text=caption, bg=app.COL_BG, fg=app.COL_TEXT,
-                     font=app.small, anchor="w", justify="left").grid(
-                         row=r, column=4, sticky="w", padx=(8, 8))
+            for j, tape in enumerate(self.ANGLES):
+                val = self._enter_value(cad, tape)
+                # highlight the diagonal where no rotation is needed
+                bg = app.COL_BG if val == 0 else app.COL_BED
+                tk.Label(grid, text=f"{val:+d}°", bg=bg, fg=app.COL_SEL,
+                         font=("TkDefaultFont", 13, "bold")).grid(
+                             row=i + 1, column=j + 1, sticky="nsew",
+                             padx=1, pady=1, ipadx=6, ipady=6)
 
         note = (
             "Note: if your OpenPnP is older than 2022-06-10, its 0° was "
-            "sprocket-holes-on-the-left,\n"
-            "not on top — add 90° to the value above to match the old "
+            "sprocket-holes-on-the-left,\nnot on top — add 90° to match the old "
             "convention."
         )
         tk.Label(self, text=note, bg=app.COL_BG, fg=app.COL_NOPART,
@@ -1775,9 +2135,15 @@ class RotationHelpDialog(tk.Toplevel):
         tk.Button(btns, text="Close", command=self.destroy).pack(side="right")
 
         self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
+        grab_when_visible(self)
 
-    # -- drawing helpers ------------------------------------------------- #
+    # -- value + drawing helpers ----------------------------------------- #
+    @staticmethod
+    def _enter_value(cad: int, tape: int) -> int:
+        """Rotation-in-feeder to enter for a (CAD, tape) pair, in (−180°,180°]."""
+        d = (tape - cad) % 360
+        return d - 360 if d > 180 else d
+
     @staticmethod
     def _rotate_visual_ccw(dx: float, dy: float,
                            deg: float) -> tuple[float, float]:
@@ -1792,14 +2158,14 @@ class RotationHelpDialog(tk.Toplevel):
         degrees CCW. If with_sprocket, also draw three sprocket holes on top
         so the tape's 0° (EIA-481) orientation is visually clear."""
         app = self.app
-        cx, cy = self.CANVAS_W / 2, self.CANVAS_H / 2 + 8
+        cx, cy = self.CELL_W / 2, self.CELL_H / 2 + 5
 
         if with_sprocket:
             # tape edge strip
-            canvas.create_rectangle(8, 4, self.CANVAS_W - 8, 18,
+            canvas.create_rectangle(6, 3, self.CELL_W - 6, 13,
                                     fill=app.COL_BG, outline=app.COL_BED_EDGE)
-            for sx in (cx - 22, cx, cx + 22):
-                canvas.create_oval(sx - 3, 8, sx + 3, 14,
+            for sx in (cx - 16, cx, cx + 16):
+                canvas.create_oval(sx - 2, 5, sx + 2, 11,
                                    fill=app.COL_BED, outline=app.COL_TEXT)
 
         # body polygon (rotated)
@@ -1813,7 +2179,7 @@ class RotationHelpDialog(tk.Toplevel):
                               outline=app.COL_BED_EDGE, width=1)
 
         # pin-1 dot — anchored to the part's top-left in CAD, rotates with it
-        pad = 6
+        pad = 5
         pdx, pdy = self._rotate_visual_ccw(-w + pad, -h + pad, rot)
         dx0, dy0 = cx + pdx, cy + pdy
         canvas.create_oval(dx0 - self.DOT_R, dy0 - self.DOT_R,
