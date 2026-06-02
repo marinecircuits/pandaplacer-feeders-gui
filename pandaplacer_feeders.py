@@ -4,7 +4,8 @@
 Reads an OpenPnP machine.xml and draws a top-down map of where every Bamboo
 feeder (BambooFeederAutoVision) sits on the machine bed, colour-coded by
 whether it is enabled and which part it carries, and lets you add, move,
-remove, re-part, enable/disable and set the tape rotation of feeders.
+remove, re-part, enable/disable and set the tape rotation/advance of feeders.
+It can also actuate a feeder over serial (via pyserial) to perform a feed.
 
 Usage:
     python3 pandaplacer_feeders.py [path/to/machine.xml]
@@ -21,6 +22,8 @@ import os
 import re
 import shutil
 import sys
+import threading
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
@@ -78,6 +81,11 @@ ORIENTATIONS_FILE = os.path.join(default_config_dir(), "tape_orientations.json")
 # when adding a feeder and updated whenever a tape advance is applied, so a
 # part's tape pitch is remembered across configs.
 ADVANCES_FILE = os.path.join(default_config_dir(), "tape_advances.json")
+
+# General app settings (serial port, baud, …) live in a small JSON file in the
+# same per-user config folder.
+SETTINGS_FILE = os.path.join(default_config_dir(), "settings.json")
+DEFAULT_BAUD = 19200
 
 # Default bed size (mm) used only if the axis soft limits can't be read.
 FALLBACK_BED = (318.0, 343.0)
@@ -589,6 +597,87 @@ def resolve_advance(part: str,
 
 
 # --------------------------------------------------------------------------- #
+# General settings + serial auto-feeder actuation
+# --------------------------------------------------------------------------- #
+# Actuating a feeder talks to the PPBFC AS feeder controller over a serial
+# port. The protocol mirrors the PPBFC AS Feeder Test Tool: each port is
+# addressed by its slot number N (= bank*100 + port, the same number used for
+# the feeder name and actuator value), and a feed is a short g-code sequence.
+# pyserial is imported lazily so the rest of the app still runs without it.
+
+
+def load_settings(path: str = SETTINGS_FILE) -> dict:
+    """Read general app settings (empty dict if missing/invalid)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(settings: dict, path: str = SETTINGS_FILE) -> None:
+    """Write general app settings, creating the config dir if needed."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def list_serial_ports() -> list[str]:
+    """Available serial port device names (empty list if pyserial is absent)."""
+    try:
+        import serial.tools.list_ports as list_ports
+    except ImportError:
+        return []
+    return [p.device for p in list_ports.comports()]
+
+
+def feed_command_sequence(slot_n: int, advance_mm: int) -> list[str]:
+    """The g-code lines that feed one auto-feeder port once.
+
+    Mirrors the PPBFC AS Feeder Test Tool's Activate + Single Advance: enable
+    the controller, deactivate all ports, activate port N, advance F mm, then
+    deactivate port N again.
+    """
+    return [
+        "M610 S1",                              # enable controller
+        "M611 S0",                              # deactivate all ports
+        f"M611 N{slot_n} S1",                   # activate this port
+        f"M600 N{slot_n} F{advance_mm} X1",     # advance F mm
+        f"M611 N{slot_n} S0",                   # deactivate this port
+    ]
+
+
+def perform_feed(port: str, baud: int, slot_n: int, advance_mm: int, *,
+                 log=None, settle_s: float = 0.3, delay_s: float = 0.2,
+                 sleep_fn=time.sleep) -> None:
+    """Open `port`, send the feed sequence for `slot_n`, then close it.
+
+    Raises ImportError if pyserial is missing, or serial.SerialException (and
+    other OSError subclasses) if the port can't be opened/written. `log(text)`,
+    if given, receives one entry per line sent.
+    """
+    try:
+        import serial
+    except ImportError as exc:                  # pragma: no cover - env-specific
+        raise ImportError(
+            "pyserial is required to actuate feeders — install it with "
+            "'pip install pyserial'.") from exc
+    emit = log or (lambda _text: None)
+    ser = serial.Serial(port, baud, timeout=5)
+    try:
+        sleep_fn(settle_s)                      # let the controller come up
+        for cmd in feed_command_sequence(slot_n, advance_mm):
+            ser.write((cmd + "\n").encode("utf-8"))
+            ser.flush()
+            emit(cmd)
+            sleep_fn(delay_s)
+    finally:
+        ser.close()
+
+
+# --------------------------------------------------------------------------- #
 # Bank / slot model (preset positions derived from existing feeders)
 # --------------------------------------------------------------------------- #
 NAME_RE = re.compile(r"PPBF-N(\d+)")
@@ -771,10 +860,13 @@ class FeederMapApp:
         self.models: dict[int, BankModel] = {}
         self.orientations: dict[str, str] = {}
         self.advances: dict[str, int] = {}
+        self.settings: dict = load_settings()
         self.bed = (0.0, 0.0, *FALLBACK_BED)
         self.items: dict[int, Feeder] = {}     # canvas item id -> feeder
         self.selected: Feeder | None = None
         self._detail_for: object = object()    # feeder currently in the panel
+        self._feeding = False                  # a serial feed is in progress
+        self._feed_confirmed = False           # feed warning shown once/session
 
         self.root = tk.Tk()
         self.root.title(f"PandaPlacer — Bamboo Feeders  [{config_path}]")
@@ -803,9 +895,16 @@ class FeederMapApp:
                   command=self.add_feeder_dialog).pack(side="left", padx=(8, 0))
         # Per-property editing now lives in the double-click Edit feeder dialog;
         # the toolbar keeps only what that dialog doesn't cover.
+        self.feed_btn = tk.Button(bar, text="▶ Perform feed",
+                                  command=self.perform_feed_selected,
+                                  state="disabled")
+        self.feed_btn.pack(side="left", padx=(8, 0))
         self.remove_btn = tk.Button(bar, text="🗑 Remove selected",
                                     command=self.remove_selected, state="disabled")
         self.remove_btn.pack(side="left", padx=(8, 0))
+        tk.Button(bar, text="⚙ Settings",
+                  command=self.open_settings_dialog).pack(side="left",
+                                                          padx=(8, 0))
         tk.Checkbutton(
             bar, text="Show disabled", variable=self.show_disabled,
             command=self.redraw, bg=self.COL_BG, fg=self.COL_TEXT,
@@ -880,7 +979,11 @@ class FeederMapApp:
         self.redraw()
 
     def _set_selection_buttons(self, enabled: bool):
-        self.remove_btn.config(state="normal" if enabled else "disabled")
+        state = "normal" if enabled else "disabled"
+        self.remove_btn.config(state=state)
+        # don't re-enable the feed button mid-feed
+        if not self._feeding:
+            self.feed_btn.config(state=state)
 
     # -- coordinate transform --------------------------------------------- #
     def _make_transform(self):
@@ -1069,6 +1172,94 @@ class FeederMapApp:
         self.load()
         self.status.config(
             text=f"Removed '{f.name}'  ·  backup: {os.path.basename(backup)}")
+
+    def open_settings_dialog(self):
+        SettingsDialog(self)
+
+    def perform_feed_selected(self):
+        """Actuate the selected feeder over serial using its slot + advance."""
+        f = self.selected
+        if f is None or self._feeding:
+            return
+        port = self.settings.get("serial_port")
+        if not port:
+            messagebox.showerror(
+                "No serial port",
+                "No serial port is configured. Open ⚙ Settings and choose the "
+                "feeder controller's port first.")
+            return
+        baud = int(self.settings.get("baud", DEFAULT_BAUD))
+        slot = parse_slot(f.name)
+        if slot is None:
+            messagebox.showerror(
+                "Unknown slot",
+                f"Can't determine a feeder slot (port N) from the name "
+                f"'{f.name}', so the feed command can't be addressed.")
+            return
+        slot_n = slot[0] * 100 + slot[1]
+        advance_mm = advance_mm_from_actuator(f.post_pick_actuator)
+        if advance_mm is None:
+            messagebox.showerror(
+                "No tape advance",
+                f"'{f.name}' has no tape advance set (post-pick-actuator-name "
+                "isn't an AutoFeeder_<N>mmAdvance). Set it via double-click → "
+                "Edit feeder first.")
+            return
+        # Warn before the first physical feed; once confirmed, don't ask again
+        # for the rest of the session.
+        if not self._feed_confirmed:
+            if not messagebox.askyesno(
+                "Perform feed",
+                f"Feed '{f.name}' now?\n\n"
+                f"Port N : {slot_n}\n"
+                f"Advance: {advance_mm} mm\n"
+                f"Serial : {port} @ {baud} baud\n\n"
+                "⚠ The feeder will physically advance the tape.\n"
+                "(Shown only once per session — later feeds run immediately.)"):
+                return
+            self._feed_confirmed = True
+        self._feeding = True
+        self.feed_btn.config(state="disabled", text="▶ Feeding…")
+        self.status.config(text=f"Feeding '{f.name}' (N{slot_n}, "
+                                f"{advance_mm} mm) on {port}…")
+
+        # Run serial I/O off the GUI thread. The worker only mutates `result`
+        # (never Tk); the main thread polls it via after(), so every widget
+        # update happens on the main thread.
+        result: dict = {}
+
+        def worker():
+            try:
+                perform_feed(port, baud, slot_n, advance_mm,
+                             log=lambda c: result.__setitem__("last", c))
+                result["err"] = None
+            except Exception as exc:        # noqa: BLE001 - surface any failure
+                result["err"] = exc
+            result["done"] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_feed(result, f.name, slot_n, advance_mm)
+
+    def _poll_feed(self, result, name, slot_n, advance_mm):
+        if not result.get("done"):
+            last = result.get("last")
+            if last:
+                self.status.config(text=f"Feeding '{name}'…  → {last}")
+            self.root.after(80, self._poll_feed, result, name, slot_n,
+                            advance_mm)
+            return
+        self._feed_done(name, slot_n, advance_mm, result.get("err"))
+
+    def _feed_done(self, name, slot_n, advance_mm, err):
+        self._feeding = False
+        self.feed_btn.config(text="▶ Perform feed",
+                             state="normal" if self.selected else "disabled")
+        if err is None:
+            self.status.config(
+                text=f"Fed '{name}'  ·  N{slot_n}  ·  {advance_mm} mm")
+        else:
+            messagebox.showerror("Feed failed", str(err))
+            self.status.config(text=f"Feed failed: {err}")
 
     def edit_feeder(self, feeder: Feeder, *, reposition: bool, bank: int,
                     port: int, part: str, enabled: bool,
@@ -1684,6 +1875,88 @@ class EditFeederDialog(tk.Toplevel):
             part=part, enabled=self.enabled_var.get(),
             rotation_in_feeder=rotation, advance_mm=advance_mm,
             move_before_feed=self.move_var.get())
+
+
+class SettingsDialog(tk.Toplevel):
+    """Configure the serial port + baud used to actuate feeders.
+
+    The port dropdown lists the system's serial ports (via pyserial) but is
+    editable, so a port that isn't auto-detected can be typed in. Settings are
+    persisted to settings.json in the per-user config folder.
+    """
+
+    BAUDS = ("4800", "9600", "19200", "38400", "57600", "115200")
+
+    def __init__(self, app: "FeederMapApp"):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Settings")
+        self.configure(bg=app.COL_BG)
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.minsize(420, 0)
+
+        pad = {"padx": 10, "pady": 8}
+        frm = tk.Frame(self, bg=app.COL_BG)
+        frm.pack(fill="both", expand=True, padx=8, pady=8)
+        frm.columnconfigure(1, weight=1)
+
+        tk.Label(frm, text="Feeder controller serial port", bg=app.COL_BG,
+                 fg=app.COL_TEXT, font=("TkDefaultFont", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky="w", **pad)
+
+        tk.Label(frm, text="Port", bg=app.COL_BG, fg=app.COL_TEXT).grid(
+            row=1, column=0, sticky="e", **pad)
+        self.port_var = tk.StringVar(value=app.settings.get("serial_port", ""))
+        self.port_cb = ttk.Combobox(frm, textvariable=self.port_var,
+                                    values=list_serial_ports(), width=26)
+        self.port_cb.grid(row=1, column=1, sticky="we", **pad)
+        tk.Button(frm, text="⟳", width=2, command=self._refresh_ports).grid(
+            row=1, column=2, sticky="w", padx=(0, 10))
+
+        tk.Label(frm, text="Baud", bg=app.COL_BG, fg=app.COL_TEXT).grid(
+            row=2, column=0, sticky="e", **pad)
+        self.baud_var = tk.StringVar(
+            value=str(app.settings.get("baud", DEFAULT_BAUD)))
+        ttk.Combobox(frm, textvariable=self.baud_var, values=self.BAUDS,
+                     width=12).grid(row=2, column=1, sticky="w", **pad)
+
+        tk.Label(frm, text="Not listed? Type the device path "
+                           "(e.g. /dev/ttyUSB0, COM3).",
+                 bg=app.COL_BG, fg=app.COL_KEY, font=app.small).grid(
+                     row=3, column=0, columnspan=3, sticky="w", **pad)
+
+        btns = tk.Frame(frm, bg=app.COL_BG)
+        btns.grid(row=4, column=0, columnspan=3, sticky="e", **pad)
+        tk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        tk.Button(btns, text="Save", command=self._save).pack(
+            side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+
+    def _refresh_ports(self):
+        self.port_cb["values"] = list_serial_ports()
+
+    def _save(self):
+        port = self.port_var.get().strip()
+        raw = self.baud_var.get().strip()
+        try:
+            baud = int(raw)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid baud", f"'{raw}' is not a number.", parent=self)
+            return
+        self.app.settings["serial_port"] = port
+        self.app.settings["baud"] = baud
+        try:
+            save_settings(self.app.settings)
+        except Exception as exc:           # noqa: BLE001 - surface any failure
+            messagebox.showerror("Save failed", str(exc), parent=self)
+            return
+        self.destroy()
+        self.app.status.config(
+            text=f"Settings saved  ·  port {port or '—'} @ {baud}")
 
 
 class RotationHelpDialog(tk.Toplevel):

@@ -3,7 +3,8 @@
 A small Tkinter app to **view and edit** the **Bamboo feeders**
 (`BambooFeederAutoVision`) in your OpenPnP `machine.xml`. It draws a top-down
 map of where every feeder sits on the machine bed, and lets you add, move,
-remove, re-part, enable/disable and set the tape rotation of feeders.
+remove, re-part, enable/disable, set the tape rotation/advance of feeders, and
+**actuate a feeder over serial** to perform a feed.
 
 ## Run
 
@@ -12,7 +13,11 @@ python3 pandaplacer_feeders.py                 # reads ~/.openpnp2/machine.xml
 python3 pandaplacer_feeders.py /path/machine.xml
 ```
 
-No dependencies beyond the Python standard library (Tkinter ships with Python).
+Viewing and editing the config needs only the Python standard library (Tkinter
+ships with Python). The **Perform feed** feature additionally needs
+[`pyserial`](https://pypi.org/project/pyserial/) to talk to the feeder
+controller — install it with `pip install pyserial`. Without it the rest of the
+app still works; only the feed button reports that pyserial is missing.
 
 ## What you see
 
@@ -167,6 +172,41 @@ write:
   left untouched. The chosen advance is saved to `tape_advances.json` so future
   feeders for the same part reuse it.
 - **Move to feeder before feeding** — the `move-before-feed` attribute.
+
+## Performing a feed (serial)
+
+Select a feeder and click **▶ Perform feed** to physically actuate it through
+the PPBFC AS feeder controller over a serial port. The command is addressed and
+sized from the feeder itself:
+
+- **Port N** = the feeder's slot number (`bank*100 + port`, the number in its
+  name and its actuator value).
+- **Advance** = the feeder's tape advance in mm (from `post-pick-actuator-name`).
+
+After you confirm, the app opens the configured serial port, sends the feed
+sequence, then closes the port. The sequence mirrors the *PPBFC AS Feeder Test
+Tool*'s Activate + Single Advance:
+
+```
+M610 S1                 ; enable controller
+M611 S0                 ; deactivate all ports
+M611 N<slot> S1         ; activate this port
+M600 N<slot> F<mm> X1   ; advance <mm> mm
+M611 N<slot> S0         ; deactivate this port
+```
+
+The serial I/O runs off the UI thread, and the status bar shows progress and
+the result. You'll get a clear message if the port isn't configured, the
+feeder has no tape advance set, the slot can't be determined from the name, or
+`pyserial` isn't installed.
+
+## Settings
+
+Click **⚙ Settings** to choose the **serial port** and **baud** (default
+`19200`) used by *Perform feed*. The port dropdown lists detected serial ports
+but is editable, so you can type a device path that isn't auto-detected (e.g.
+`/dev/ttyUSB0`, `COM3`). Settings are saved to `settings.json` in the same
+per-user config folder as the orientation/advance maps.
 
 ## Removing a feeder
 
