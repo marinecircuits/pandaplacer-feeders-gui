@@ -839,6 +839,21 @@ def derive_bank_models(feeders: list[Feeder]) -> dict[int, BankModel]:
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
+def grab_when_visible(win: tk.Toplevel) -> None:
+    """Make `win` modal once it is actually mapped.
+
+    Calling grab_set() straight from a Toplevel's __init__ races the window
+    manager: the window often isn't viewable yet, raising
+    'grab failed: window not viewable'. Retry on the event loop until it is
+    viewable (or the window is gone)."""
+    try:
+        if not win.winfo_exists():
+            return
+        win.grab_set()
+    except tk.TclError:
+        win.after(20, lambda: grab_when_visible(win))
+
+
 class FeederMapApp:
     PAD = 60          # canvas padding (px) around the bed
     MARKER = 9        # feeder marker half-size (px)
@@ -1613,7 +1628,7 @@ class AddFeederDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         self.bank_var.set(banks[0])
         self.port_var.set("0")
-        self.grab_set()
+        grab_when_visible(self)
 
     # current (bank, port) or (None, None) if incomplete
     def _selection(self):
@@ -1835,7 +1850,7 @@ class EditFeederDialog(tk.Toplevel):
 
         self.bind("<Escape>", lambda e: self.destroy())
         self._update_preview()
-        self.grab_set()
+        grab_when_visible(self)
 
     def _selection(self):
         try:
@@ -2008,7 +2023,7 @@ class SettingsDialog(tk.Toplevel):
             side="right", padx=(0, 8))
 
         self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
+        grab_when_visible(self)
 
     def _refresh_ports(self):
         self.port_cb["values"] = list_serial_ports()
@@ -2123,7 +2138,7 @@ class RotationHelpDialog(tk.Toplevel):
         tk.Button(btns, text="Close", command=self.destroy).pack(side="right")
 
         self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
+        grab_when_visible(self)
 
     # -- drawing helpers ------------------------------------------------- #
     @staticmethod
