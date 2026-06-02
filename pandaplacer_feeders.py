@@ -2050,26 +2050,20 @@ class SettingsDialog(tk.Toplevel):
 
 
 class RotationHelpDialog(tk.Toplevel):
-    """Visual guide: how to read 'rotation in tape' from a CAD/tape pair.
+    """Matrix guide for the 'rotation in tape' value.
 
-    Follows OpenPnP's EIA-481 convention: tape 0° is sprocket holes on top,
-    + is CCW, − is CW. The value is the part's rotation in the tape pocket
-    relative to its upright orientation in the E-CAD library footprint.
+    Rows = the part's rotation in the CAD library; columns = how it appears in
+    the tape (sprocket holes on top, EIA-481). Each cell is the value to enter:
+    rotation-in-feeder = tape − CAD (CCW positive), normalised to (−180°, 180°].
     """
 
-    # Each row: (rotation°, one-line caption explaining what the user sees)
-    EXAMPLES = (
-        (0,    "Part sits in the tape the same way as in CAD."),
-        (-90,  "Part rotated 90° clockwise in the tape (pin 1 → top-right)."),
-        (180,  "Part rotated 180° in the tape (pin 1 → bottom-right)."),
-        (90,   "Part rotated 90° counter-clockwise (pin 1 → bottom-left)."),
-    )
+    ANGLES = (0, 90, 180, 270)     # measured CCW from the upright orientation
 
-    BODY_W = 28          # half-width of the chip in px
-    BODY_H = 18          # half-height of the chip in px
+    BODY_W = 17          # half-width of the chip body (px)
+    BODY_H = 11          # half-height of the chip body (px)
     DOT_R = 3            # pin-1 dot radius
-    CANVAS_W = 110
-    CANVAS_H = 80
+    CELL_W = 74          # header chip canvas width (px)
+    CELL_H = 54          # header chip canvas height (px)
 
     def __init__(self, app: "FeederMapApp", parent: tk.Toplevel | None = None):
         super().__init__(parent if parent is not None else app.root)
@@ -2079,54 +2073,57 @@ class RotationHelpDialog(tk.Toplevel):
         self.transient(parent if parent is not None else app.root)
         self.resizable(False, False)
 
-        pad = {"padx": 12, "pady": 6}
         intro = (
-            "Rotation in tape = how the part is turned inside the tape pocket,\n"
-            "measured against its upright orientation in your CAD library.\n"
-            "\n"
-            "  1. View the part upright in CAD — pin 1 / pol. mark = ●.\n"
-            "  2. View the tape with sprocket holes on TOP (EIA-481).\n"
-            "  3. The angle from CAD-upright → tape orientation is the value.\n"
-            "     Positive = CCW, negative = CW."
+            "Find the part's rotation in your CAD library (row) and how it sits "
+            "in the tape\n(column — sprocket holes on top, EIA-481). The cell is "
+            "the Rotation-in-tape value\nto enter.   ● = pin 1 / polarity mark."
         )
         tk.Label(self, text=intro, bg=app.COL_BG, fg=app.COL_TEXT,
                  justify="left", anchor="w", font=app.mono).pack(
-                     anchor="w", **pad)
+                     anchor="w", padx=12, pady=(10, 6))
 
-        # header row
         grid = tk.Frame(self, bg=app.COL_BG)
-        grid.pack(fill="x", padx=12, pady=(2, 4))
-        for col, text in enumerate(("CAD (library)", "", "Tape", "Enter")):
-            tk.Label(grid, text=text, bg=app.COL_BG, fg=app.COL_TEXT,
-                     font=("TkDefaultFont", 10, "bold")).grid(
-                         row=0, column=col, padx=8, pady=(0, 4))
+        grid.pack(padx=12, pady=4)
 
-        for r, (rot, caption) in enumerate(self.EXAMPLES, start=1):
-            cad = tk.Canvas(grid, width=self.CANVAS_W, height=self.CANVAS_H,
-                            bg=app.COL_BED, highlightthickness=0)
-            cad.grid(row=r, column=0, padx=8, pady=4)
-            self._draw_chip(cad, rot=0, with_sprocket=False)
+        # corner cell
+        tk.Label(grid, text="CAD ↓\nTape →", bg=app.COL_BED, fg=app.COL_TEXT,
+                 font=("TkDefaultFont", 9, "bold"), justify="center").grid(
+                     row=0, column=0, sticky="nsew", padx=1, pady=1)
 
-            tk.Label(grid, text="→", bg=app.COL_BG, fg=app.COL_TEXT,
-                     font=("TkDefaultFont", 14)).grid(
-                         row=r, column=1, padx=4)
+        # column headers — how the part appears in the tape
+        for j, tape in enumerate(self.ANGLES):
+            cell = tk.Frame(grid, bg=app.COL_BED)
+            cell.grid(row=0, column=j + 1, sticky="nsew", padx=1, pady=1)
+            cv = tk.Canvas(cell, width=self.CELL_W, height=self.CELL_H,
+                           bg=app.COL_BED, highlightthickness=0)
+            cv.pack()
+            self._draw_chip(cv, rot=tape, with_sprocket=True)
+            tk.Label(cell, text=f"{tape}°", bg=app.COL_BED, fg=app.COL_TEXT,
+                     font=("TkDefaultFont", 9, "bold")).pack()
 
-            tape = tk.Canvas(grid, width=self.CANVAS_W, height=self.CANVAS_H,
-                             bg=app.COL_BED, highlightthickness=0)
-            tape.grid(row=r, column=2, padx=8, pady=4)
-            self._draw_chip(tape, rot=rot, with_sprocket=True)
+        # rows — CAD-library orientation header + the value cells
+        for i, cad in enumerate(self.ANGLES):
+            hdr = tk.Frame(grid, bg=app.COL_BED)
+            hdr.grid(row=i + 1, column=0, sticky="nsew", padx=1, pady=1)
+            cv = tk.Canvas(hdr, width=self.CELL_W, height=self.CELL_H,
+                           bg=app.COL_BED, highlightthickness=0)
+            cv.pack()
+            self._draw_chip(cv, rot=cad, with_sprocket=False)
+            tk.Label(hdr, text=f"{cad}°", bg=app.COL_BED, fg=app.COL_TEXT,
+                     font=("TkDefaultFont", 9, "bold")).pack()
 
-            tk.Label(grid, text=f"{rot:+d}°", bg=app.COL_BG, fg=app.COL_SEL,
-                     font=("TkDefaultFont", 12, "bold")).grid(
-                         row=r, column=3, padx=8)
-            tk.Label(grid, text=caption, bg=app.COL_BG, fg=app.COL_TEXT,
-                     font=app.small, anchor="w", justify="left").grid(
-                         row=r, column=4, sticky="w", padx=(8, 8))
+            for j, tape in enumerate(self.ANGLES):
+                val = self._enter_value(cad, tape)
+                # highlight the diagonal where no rotation is needed
+                bg = app.COL_BG if val == 0 else app.COL_BED
+                tk.Label(grid, text=f"{val:+d}°", bg=bg, fg=app.COL_SEL,
+                         font=("TkDefaultFont", 13, "bold")).grid(
+                             row=i + 1, column=j + 1, sticky="nsew",
+                             padx=1, pady=1, ipadx=6, ipady=6)
 
         note = (
             "Note: if your OpenPnP is older than 2022-06-10, its 0° was "
-            "sprocket-holes-on-the-left,\n"
-            "not on top — add 90° to the value above to match the old "
+            "sprocket-holes-on-the-left,\nnot on top — add 90° to match the old "
             "convention."
         )
         tk.Label(self, text=note, bg=app.COL_BG, fg=app.COL_NOPART,
@@ -2140,7 +2137,13 @@ class RotationHelpDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         grab_when_visible(self)
 
-    # -- drawing helpers ------------------------------------------------- #
+    # -- value + drawing helpers ----------------------------------------- #
+    @staticmethod
+    def _enter_value(cad: int, tape: int) -> int:
+        """Rotation-in-feeder to enter for a (CAD, tape) pair, in (−180°,180°]."""
+        d = (tape - cad) % 360
+        return d - 360 if d > 180 else d
+
     @staticmethod
     def _rotate_visual_ccw(dx: float, dy: float,
                            deg: float) -> tuple[float, float]:
@@ -2155,14 +2158,14 @@ class RotationHelpDialog(tk.Toplevel):
         degrees CCW. If with_sprocket, also draw three sprocket holes on top
         so the tape's 0° (EIA-481) orientation is visually clear."""
         app = self.app
-        cx, cy = self.CANVAS_W / 2, self.CANVAS_H / 2 + 8
+        cx, cy = self.CELL_W / 2, self.CELL_H / 2 + 5
 
         if with_sprocket:
             # tape edge strip
-            canvas.create_rectangle(8, 4, self.CANVAS_W - 8, 18,
+            canvas.create_rectangle(6, 3, self.CELL_W - 6, 13,
                                     fill=app.COL_BG, outline=app.COL_BED_EDGE)
-            for sx in (cx - 22, cx, cx + 22):
-                canvas.create_oval(sx - 3, 8, sx + 3, 14,
+            for sx in (cx - 16, cx, cx + 16):
+                canvas.create_oval(sx - 2, 5, sx + 2, 11,
                                    fill=app.COL_BED, outline=app.COL_TEXT)
 
         # body polygon (rotated)
@@ -2176,7 +2179,7 @@ class RotationHelpDialog(tk.Toplevel):
                               outline=app.COL_BED_EDGE, width=1)
 
         # pin-1 dot — anchored to the part's top-left in CAD, rotates with it
-        pad = 6
+        pad = 5
         pdx, pdy = self._rotate_visual_ccw(-w + pad, -h + pad, rot)
         dx0, dy0 = cx + pdx, cy + pdy
         canvas.create_oval(dx0 - self.DOT_R, dy0 - self.DOT_R,
