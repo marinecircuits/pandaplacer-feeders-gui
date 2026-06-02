@@ -73,6 +73,12 @@ def ensure_config_dir() -> str:
 # feeder is removed.
 ORIENTATIONS_FILE = os.path.join(default_config_dir(), "tape_orientations.json")
 
+# Preferred tape advances are stored the same way, in a sibling JSON map:
+# { "<part-id>": <advance-mm>, ... }. Like the orientation map it is consulted
+# when adding a feeder and updated whenever a tape advance is applied, so a
+# part's tape pitch is remembered across configs.
+ADVANCES_FILE = os.path.join(default_config_dir(), "tape_advances.json")
+
 # Default bed size (mm) used only if the axis soft limits can't be read.
 FALLBACK_BED = (318.0, 343.0)
 
@@ -91,6 +97,8 @@ class Feeder:
     rotation: float
     rotation_in_feeder: str
     feed_count: str
+    post_pick_actuator: str
+    move_before_feed: bool
 
     @property
     def has_part(self) -> bool:
@@ -123,6 +131,9 @@ def parse_config(path: str) -> tuple[list[Feeder], tuple[float, float, float, fl
                 rotation=float(loc.get("rotation", 0.0)),
                 rotation_in_feeder=f.get("rotation-in-feeder", ""),
                 feed_count=f.get("feed-count", ""),
+                post_pick_actuator=f.get("post-pick-actuator-name", ""),
+                move_before_feed=f.get("move-before-feed", "false").lower()
+                == "true",
             )
         )
 
@@ -219,9 +230,14 @@ def extract_feeder_block(text: str, fid: str) -> str:
 
 
 def update_feeder_text(text: str, fid: str, *, name: str,
-                       x: float, y: float, z: float, rotation: float) -> str:
+                       x: float, y: float, z: float, rotation: float,
+                       actuator_value: str | None = None) -> str:
     """Rewrite a feeder's name and pick location in place, leaving the rest of
-    its block (pipeline etc.) and the rest of the file untouched."""
+    its block (pipeline etc.) and the rest of the file untouched.
+
+    If actuator_value is given, the feed-actuator-value and
+    post-pick-actuator-value are rewritten too, so a feeder moved to a new slot
+    drives that slot's auto-feeder instead of its old one."""
     m = _feeder_block_re(fid).search(text)
     if not m:
         raise ValueError(f"feeder {fid!r} not found")
@@ -229,6 +245,11 @@ def update_feeder_text(text: str, fid: str, *, name: str,
     bm = re.match(r'(\s*)(<feeder\b[^>]*?>)(.*)', block, re.DOTALL)
     indent, open_tag, rest = bm.groups()
     open_tag = _set_attr(open_tag, "name", name)
+    if actuator_value is not None:
+        open_tag = _set_or_add_attr(open_tag, "feed-actuator-value",
+                                    str(actuator_value))
+        open_tag = _set_or_add_attr(open_tag, "post-pick-actuator-value",
+                                    str(actuator_value))
     loc = (f'<location units="Millimeters" x="{x}" y="{y}" '
            f'z="{z}" rotation="{rotation}"/>')
     rest, n = re.subn(r'<location\b[^>]*?/>', loc, rest, count=1)
@@ -273,6 +294,21 @@ def set_feeder_rotation_in_feeder_text(text: str, fid: str,
         text, fid, {"rotation-in-feeder": f"{rotation}"})
 
 
+def set_feeder_post_pick_actuator_text(text: str, fid: str,
+                                       actuator_name: str) -> str:
+    """Change only a feeder's post-pick-actuator-name — the tape advance, e.g.
+    'AutoFeeder_4mmAdvance'. The post-pick value (slot number) is left as-is."""
+    return _rewrite_feeder_open_tag(
+        text, fid, {"post-pick-actuator-name": actuator_name})
+
+
+def set_feeder_move_before_feed_text(text: str, fid: str,
+                                     enabled: bool) -> str:
+    """Change only a feeder's move-before-feed attribute."""
+    return _rewrite_feeder_open_tag(
+        text, fid, {"move-before-feed": "true" if enabled else "false"})
+
+
 def make_feeder_id(existing: set[str]) -> str:
     """Generate an OpenPnP-style feeder id ('FDR' + 16 hex) not already in use."""
     import secrets
@@ -314,12 +350,23 @@ def _set_or_add_attr(tag: str, attr: str, value: str) -> str:
 def build_feeder_block(template: str, *, fid: str, name: str, part: str,
                        enabled: bool, x: float, y: float, z: float,
                        rotation: float,
-                       rotation_in_feeder: str | None = None) -> str:
+                       rotation_in_feeder: str | None = None,
+                       actuator_value: str | None = None,
+                       post_pick_actuator: str | None = None) -> str:
     """Clone a feeder template block, swapping in the new feeder's fields.
 
     If rotation_in_feeder is given it overrides the template's tape orientation
     (added if the template lacks the attribute); otherwise the clone keeps the
     template's value.
+
+    If post_pick_actuator is given it overrides the template's tape advance
+    (post-pick-actuator-name, e.g. 'AutoFeeder_4mmAdvance'); otherwise the
+    clone keeps the template's.
+
+    If actuator_value is given it overrides both feed-actuator-value and
+    post-pick-actuator-value (the auto-feeder's slot number); otherwise the
+    clone keeps the template's — which would be the *template's* slot, not the
+    new feeder's, so callers cloning into a different slot should pass it.
     """
     m = re.match(r'(\s*)(<feeder\b[^>]*?>)(.*)', template, re.DOTALL)
     if not m:
@@ -333,6 +380,14 @@ def build_feeder_block(template: str, *, fid: str, name: str, part: str,
     if rotation_in_feeder is not None:
         open_tag = _set_or_add_attr(open_tag, "rotation-in-feeder",
                                     str(rotation_in_feeder))
+    if actuator_value is not None:
+        open_tag = _set_or_add_attr(open_tag, "feed-actuator-value",
+                                    str(actuator_value))
+        open_tag = _set_or_add_attr(open_tag, "post-pick-actuator-value",
+                                    str(actuator_value))
+    if post_pick_actuator is not None:
+        open_tag = _set_or_add_attr(open_tag, "post-pick-actuator-name",
+                                    post_pick_actuator)
     loc = (f'<location units="Millimeters" x="{x}" y="{y}" '
            f'z="{z}" rotation="{rotation}"/>')
     rest, n = re.subn(r'<location\b[^>]*?/>', loc, rest, count=1)
@@ -438,6 +493,102 @@ def resolve_tape_rotation(part: str,
 
 
 # --------------------------------------------------------------------------- #
+# Tape-advance (post-pick actuator) memory
+# --------------------------------------------------------------------------- #
+# The tape advance — how far the tape steps after a pick — is encoded in the
+# post-pick-actuator-name as 'AutoFeeder_<N>mmAdvance' (the machine defines a
+# 2/4/8/12 mm set). It is a property of the part's tape, so it is remembered
+# per part just like the orientation.
+ADVANCE_RE = re.compile(r"AutoFeeder_(\d+)mmAdvance")
+ADVANCE_ACTUATOR_FMT = "AutoFeeder_{}mmAdvance"
+DEFAULT_ADVANCES_MM = (2, 4, 8, 12)
+
+
+def advance_mm_from_actuator(name: str) -> int | None:
+    """The advance distance in mm from a post-pick actuator name, or None.
+
+    'AutoFeeder_4mmAdvance' -> 4; anything that isn't an advance actuator
+    (e.g. '' or 'AutoFeeder_PostPick') -> None.
+    """
+    if not name:
+        return None
+    m = ADVANCE_RE.fullmatch(name) or ADVANCE_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def actuator_for_advance_mm(mm: int) -> str:
+    """The post-pick actuator name for an advance distance: 4 -> 'AutoFeeder_4mmAdvance'."""
+    return ADVANCE_ACTUATOR_FMT.format(int(mm))
+
+
+def read_advance_actuators(config_path: str) -> list[int]:
+    """Tape-advance distances (mm) the machine defines, sorted ascending.
+
+    Parsed from the AutoFeeder_<N>mmAdvance actuators in machine.xml; falls
+    back to the standard 2/4/8/12 mm set if none are found or it can't be read.
+    """
+    try:
+        root = ET.parse(config_path).getroot()
+    except (FileNotFoundError, ET.ParseError):
+        return list(DEFAULT_ADVANCES_MM)
+    found = {advance_mm_from_actuator(a.get("name", ""))
+             for a in root.iter("actuator")}
+    found.discard(None)
+    return sorted(found) if found else list(DEFAULT_ADVANCES_MM)
+
+
+def load_advances(path: str = ADVANCES_FILE) -> dict[str, int]:
+    """Read the part -> tape-advance-mm map (empty dict if missing/invalid)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in data.items():
+        try:
+            out[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def save_advance(part: str, mm: int, path: str = ADVANCES_FILE) -> None:
+    """Remember `part`'s tape advance (mm) in the JSON map (create/update it).
+
+    No-op for parts with no real part id. Existing entries are preserved and
+    the file is written sorted, for a stable, human-editable, diffable result.
+    """
+    if part in NO_PART:
+        return
+    data = load_advances(path)
+    if data.get(part) == int(mm):
+        return                          # already up to date — avoid a needless write
+    data[part] = int(mm)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(dict(sorted(data.items())), fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def resolve_advance(part: str,
+                    advances: dict[str, int]) -> tuple[int | None, str | None]:
+    """Decide the tape advance (mm) for a new feeder carrying `part`.
+
+    Returns (advance_mm, source): a value remembered in the advances map
+    (source 'history'), else (None, None) — keep whatever the cloned template
+    has. There is no size-based default for advance (unlike R/C rotation).
+    """
+    if part in NO_PART:
+        return None, None
+    if part in advances:
+        return advances[part], "history"
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
 # Bank / slot model (preset positions derived from existing feeders)
 # --------------------------------------------------------------------------- #
 NAME_RE = re.compile(r"PPBF-N(\d+)")
@@ -468,6 +619,38 @@ def parse_slot(name: str) -> tuple[int, int] | None:
         return None
     num = int(m.group(1))
     return num // 100, num % 100
+
+
+def slot_label(name: str) -> str:
+    """Short map label: the slot number zero-padded to 3 digits.
+
+    'PPBF-N0' -> 'N000', 'PPBF-N11' -> 'N011', 'PPBF-N312-Reserved' -> 'N312'.
+    Falls back to the trailing name segment for names without a slot number.
+    """
+    slot = parse_slot(name)
+    if slot is not None:
+        bank, port = slot
+        return f"N{bank * 100 + port:03d}"
+    return name.split("-")[-1] if "-" in name else name
+
+
+def actuator_value_for_name(name: str) -> str | None:
+    """The Bamboo auto-feeder actuator value for a slot feeder.
+
+    Each PPBF-N<num> feeder drives the auto-feeder identified by its slot
+    number (bank*100 + port = the number in the name), so both
+    feed-actuator-value and post-pick-actuator-value equal it: PPBF-N305 ->
+    "305.0", PPBF-N7 -> "7.0". Returns None for a name that doesn't encode a
+    slot, in which case the cloned template's value is kept untouched.
+
+    The actuator *names* (e.g. AutoFeeder_4mm/8mm/12mmAdvance) depend on the
+    tape width, not the slot, so they are left as cloned.
+    """
+    slot = parse_slot(name)
+    if slot is None:
+        return None
+    bank, port = slot
+    return f"{bank * 100 + port}.0"
 
 
 class BankModel:
@@ -579,6 +762,7 @@ class FeederMapApp:
     COL_NOPART = "#d29922"
     COL_DISABLED = "#5a5f6e"
     COL_TEXT = "#e6e6e6"
+    COL_KEY = "#9aa0ad"     # muted label colour for detail-panel keys
     COL_SEL = "#58a6ff"
 
     def __init__(self, config_path: str):
@@ -586,9 +770,11 @@ class FeederMapApp:
         self.feeders: list[Feeder] = []
         self.models: dict[int, BankModel] = {}
         self.orientations: dict[str, str] = {}
+        self.advances: dict[str, int] = {}
         self.bed = (0.0, 0.0, *FALLBACK_BED)
         self.items: dict[int, Feeder] = {}     # canvas item id -> feeder
         self.selected: Feeder | None = None
+        self._detail_for: object = object()    # feeder currently in the panel
 
         self.root = tk.Tk()
         self.root.title(f"PandaPlacer — Bamboo Feeders  [{config_path}]")
@@ -615,16 +801,8 @@ class FeederMapApp:
         tk.Button(bar, text="⟳ Reload", command=self.load).pack(side="left")
         tk.Button(bar, text="＋ Add feeder",
                   command=self.add_feeder_dialog).pack(side="left", padx=(8, 0))
-        self.move_btn = tk.Button(bar, text="⇄ Move selected",
-                                  command=self.move_selected, state="disabled")
-        self.move_btn.pack(side="left", padx=(8, 0))
-        self.part_btn = tk.Button(bar, text="🏷 Set part",
-                                  command=self.change_part_selected, state="disabled")
-        self.part_btn.pack(side="left", padx=(8, 0))
-        self.rot_btn = tk.Button(bar, text="⟲ Tape rotation",
-                                 command=self.change_rotation_selected,
-                                 state="disabled")
-        self.rot_btn.pack(side="left", padx=(8, 0))
+        # Per-property editing now lives in the double-click Edit feeder dialog;
+        # the toolbar keeps only what that dialog doesn't cover.
         self.remove_btn = tk.Button(bar, text="🗑 Remove selected",
                                     command=self.remove_selected, state="disabled")
         self.remove_btn.pack(side="left", padx=(8, 0))
@@ -673,10 +851,13 @@ class FeederMapApp:
         side.pack_propagate(False)
         tk.Label(side, text="Feeder details", bg=self.COL_BED, fg=self.COL_TEXT,
                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w", padx=12, pady=(12, 4))
-        self.detail = tk.Label(side, text="Hover or click a feeder.",
-                               bg=self.COL_BED, fg=self.COL_TEXT, justify="left",
-                               anchor="nw", font=self.mono)
+        # Two-column key/value grid — the grid geometry manager keeps the value
+        # column aligned regardless of font, so it no longer relies on a
+        # monospaced font and manual space-padding to line up.
+        self.detail = tk.Frame(side, bg=self.COL_BED)
         self.detail.pack(fill="both", expand=True, padx=12, pady=4)
+        self.detail.columnconfigure(1, weight=1)
+        self._show_details(None)
 
         self.tooltip = None
 
@@ -692,16 +873,14 @@ class FeederMapApp:
             return
         self.models = derive_bank_models(self.feeders)
         self.orientations = load_orientations()
+        self.advances = load_advances()
         self.selected = None
+        self._show_details(None)
         self._set_selection_buttons(False)
         self.redraw()
 
     def _set_selection_buttons(self, enabled: bool):
-        state = "normal" if enabled else "disabled"
-        for attr in ("move_btn", "part_btn", "rot_btn", "remove_btn"):
-            btn = getattr(self, attr, None)
-            if btn is not None:
-                btn.config(state=state)
+        self.remove_btn.config(state="normal" if enabled else "disabled")
 
     # -- coordinate transform --------------------------------------------- #
     def _make_transform(self):
@@ -794,12 +973,19 @@ class FeederMapApp:
         self.items[item] = f
 
         # slot-number label box, placed on the outboard side of the bed so the
-        # markers stay in clean columns and labels sit in the margin. The part
-        # id (if any) is shown on the same line after the slot number.
-        label = f.name.split("-")[-1] if "-" in f.name else f.name
-        text = f"{label}  {f.part}" if f.has_part else label
+        # markers stay in clean columns and labels sit in the margin. The slot
+        # number is kept next to the marker (right end of the box for left-side
+        # feeders, left end for right-side ones) so the numbers line up against
+        # the bed; the part id (if any) sits on the other side.
+        label = slot_label(f.name)
         xmin, _, xmax, _ = self.bed
         on_left = f.x < (xmin + xmax) / 2
+        if not f.has_part:
+            text = label
+        elif on_left:
+            text = f"{f.part}  {label}"
+        else:
+            text = f"{label}  {f.part}"
         gap = 6
         lw = self.label.measure(text) + 12
         lh = self.label.metrics("linespace") + 6
@@ -827,8 +1013,7 @@ class FeederMapApp:
     def _on_click(self, event):
         f = self._feeder_at(event.x, event.y)
         self.selected = f
-        if f:
-            self.detail.config(text=self._describe(f))
+        self._show_details(f)
         self._set_selection_buttons(bool(f))
         self.redraw()
 
@@ -836,32 +1021,10 @@ class FeederMapApp:
         f = self._feeder_at(event.x, event.y)
         if f:
             self.selected = f
-            self.toggle_enabled(f)
-
-    def toggle_enabled(self, feeder: Feeder):
-        """Flip a feeder's enabled state."""
-        if not self._openpnp_guard():
-            return
-        new_state = not feeder.enabled
-        try:
-            with open(self.config_path, encoding="utf-8") as fh:
-                text = fh.read()
-            new_text = set_feeder_enabled_text(text, feeder.fid, new_state)
-            backup = backup_config(self.config_path)
-            with open(self.config_path, "w", encoding="utf-8") as fh:
-                fh.write(new_text)
-        except Exception as exc:           # noqa: BLE001 - surface any failure
-            messagebox.showerror("Toggle failed", str(exc))
-            return
-        self.load()
-        self.selected = next((f for f in self.feeders if f.fid == feeder.fid), None)
-        if self.selected:
-            self.detail.config(text=self._describe(self.selected))
+            self._show_details(f)
             self._set_selection_buttons(True)
-        self.redraw()
-        self.status.config(
-            text=f"{'Enabled' if new_state else 'Disabled'} '{feeder.name}'  ·  "
-                 f"backup: {os.path.basename(backup)}")
+            self.redraw()
+            EditFeederDialog(self, f)
 
     def _openpnp_guard(self) -> bool:
         """Block edits while OpenPnP is running; return True if safe to proceed."""
@@ -907,101 +1070,54 @@ class FeederMapApp:
         self.status.config(
             text=f"Removed '{f.name}'  ·  backup: {os.path.basename(backup)}")
 
-    def move_selected(self):
-        if self.selected is None:
-            return
-        if not self.models:
-            messagebox.showerror("No banks", "No bank presets available.")
-            return
-        MoveFeederDialog(self, self.selected)
+    def edit_feeder(self, feeder: Feeder, *, reposition: bool, bank: int,
+                    port: int, part: str, enabled: bool,
+                    rotation_in_feeder: float, advance_mm: int,
+                    move_before_feed: bool):
+        """Apply every editable property of a feeder in one backup + write.
 
-    def move_feeder(self, feeder: Feeder, bank: int, port: int):
-        """Reposition a feeder onto a bank/port preset and rename it to match."""
-        if not self._openpnp_guard():
-            return
-        model = self.models[bank]
-        x, y, z, rot = model.position(port)
-        name = slot_name(bank, port)
-        try:
-            with open(self.config_path, encoding="utf-8") as fh:
-                text = fh.read()
-            new_text = update_feeder_text(text, feeder.fid, name=name,
-                                          x=x, y=y, z=z, rotation=rot)
-            backup = backup_config(self.config_path)
-            with open(self.config_path, "w", encoding="utf-8") as fh:
-                fh.write(new_text)
-        except Exception as exc:           # noqa: BLE001 - surface any failure
-            messagebox.showerror("Move failed", str(exc))
-            return
-        self.load()
-        self.selected = next((f for f in self.feeders if f.fid == feeder.fid), None)
-        if self.selected:
-            self.detail.config(text=self._describe(self.selected))
-            self._set_selection_buttons(True)
-        self.redraw()
-        self.status.config(
-            text=f"Moved to '{name}'  ·  backup: {os.path.basename(backup)}")
-
-    def change_part_selected(self):
-        if self.selected is None:
-            return
-        ChangePartDialog(self, self.selected)
-
-    def change_part(self, feeder: Feeder, part: str):
-        """Change a feeder's associated part id."""
-        if not self._openpnp_guard():
-            return
-        part = part.strip() or "NC"
-        try:
-            with open(self.config_path, encoding="utf-8") as fh:
-                text = fh.read()
-            new_text = set_feeder_part_text(text, feeder.fid, part)
-            backup = backup_config(self.config_path)
-            with open(self.config_path, "w", encoding="utf-8") as fh:
-                fh.write(new_text)
-        except Exception as exc:           # noqa: BLE001 - surface any failure
-            messagebox.showerror("Set part failed", str(exc))
-            return
-        self.load()
-        self.selected = next((f for f in self.feeders if f.fid == feeder.fid), None)
-        if self.selected:
-            self.detail.config(text=self._describe(self.selected))
-            self._set_selection_buttons(True)
-        self.redraw()
-        self.status.config(
-            text=f"Set part of '{feeder.name}' to '{part}'  ·  "
-                 f"backup: {os.path.basename(backup)}")
-
-    def change_rotation_selected(self):
-        if self.selected is None:
-            return
-        ChangeRotationDialog(self, self.selected)
-
-    def change_rotation_in_feeder(self, feeder: Feeder, rotation: float):
-        """Change a feeder's rotation-in-feeder (orientation in the tape)."""
+        Position is only rewritten when `reposition` is set (the slot was
+        changed), so a calibrated feeder left on its slot keeps its exact x/y.
+        The remembered tape rotation / advance for the part are updated too.
+        """
         if not self._openpnp_guard():
             return
         try:
             with open(self.config_path, encoding="utf-8") as fh:
                 text = fh.read()
-            new_text = set_feeder_rotation_in_feeder_text(
-                text, feeder.fid, rotation)
+            if reposition:
+                model = self.models[bank]
+                x, y, z, rot = model.position(port)
+                name = slot_name(bank, port)
+                text = update_feeder_text(
+                    text, feeder.fid, name=name, x=x, y=y, z=z, rotation=rot,
+                    actuator_value=actuator_value_for_name(name))
+            else:
+                name = feeder.name
+            text = set_feeder_part_text(text, feeder.fid, part)
+            text = set_feeder_enabled_text(text, feeder.fid, enabled)
+            text = set_feeder_rotation_in_feeder_text(
+                text, feeder.fid, rotation_in_feeder)
+            text = set_feeder_post_pick_actuator_text(
+                text, feeder.fid, actuator_for_advance_mm(advance_mm))
+            text = set_feeder_move_before_feed_text(
+                text, feeder.fid, move_before_feed)
             backup = backup_config(self.config_path)
             with open(self.config_path, "w", encoding="utf-8") as fh:
-                fh.write(new_text)
+                fh.write(text)
         except Exception as exc:           # noqa: BLE001 - surface any failure
-            messagebox.showerror("Set tape rotation failed", str(exc))
+            messagebox.showerror("Edit failed", str(exc))
             return
-        save_orientation(feeder.part, rotation)    # remember this preference
+        save_orientation(part, rotation_in_feeder)   # remember preferences
+        save_advance(part, advance_mm)
         self.load()
         self.selected = next((f for f in self.feeders if f.fid == feeder.fid), None)
         if self.selected:
-            self.detail.config(text=self._describe(self.selected))
+            self._show_details(self.selected)
             self._set_selection_buttons(True)
         self.redraw()
         self.status.config(
-            text=f"Tape rotation of '{feeder.name}' → {rotation}°  ·  "
-                 f"backup: {os.path.basename(backup)}")
+            text=f"Edited '{name}'  ·  backup: {os.path.basename(backup)}")
 
     def add_feeder_dialog(self):
         if not self.models:
@@ -1020,10 +1136,20 @@ class FeederMapApp:
         a value remembered in the orientations map is preferred, else the
         standard -90° for 0603/0805 R/C parts, else the template's own value.
         The applied orientation is then saved back to the map.
+
+        The auto-feeder actuator value (feed/post-pick) is set from the new
+        feeder's slot number so it drives the right physical feeder, rather
+        than inheriting the cloned template's slot.
+
+        The tape advance (post-pick-actuator-name) is set from the part's
+        remembered value if there is one, else the cloned template's is kept.
         """
         if not self._openpnp_guard():
             return
         tape_rot, src = resolve_tape_rotation(part, self.orientations)
+        actuator_value = actuator_value_for_name(name)
+        adv_mm, adv_src = resolve_advance(part, self.advances)
+        post_pick = actuator_for_advance_mm(adv_mm) if adv_mm is not None else None
         try:
             with open(self.config_path, encoding="utf-8") as fh:
                 text = fh.read()
@@ -1033,7 +1159,8 @@ class FeederMapApp:
             block = build_feeder_block(
                 template_block, fid=new_id, name=name, part=part,
                 enabled=enabled, x=x, y=y, z=z, rotation=rotation,
-                rotation_in_feeder=tape_rot)
+                rotation_in_feeder=tape_rot, actuator_value=actuator_value,
+                post_pick_actuator=post_pick)
             new_text = insert_feeder_text(text, block)
             backup = backup_config(self.config_path)
             with open(self.config_path, "w", encoding="utf-8") as fh:
@@ -1043,10 +1170,12 @@ class FeederMapApp:
             return
         if tape_rot is not None:
             save_orientation(part, tape_rot)   # remember for next time
+        if adv_mm is not None:
+            save_advance(part, adv_mm)         # remember for next time
         self.load()
         self.selected = next((f for f in self.feeders if f.fid == new_id), None)
         if self.selected:
-            self.detail.config(text=self._describe(self.selected))
+            self._show_details(self.selected)
             self._set_selection_buttons(True)
         self.redraw()
         if src == "history":
@@ -1058,35 +1187,77 @@ class FeederMapApp:
                          f"(saved for next time).\n\n")
         else:
             tape_note = ""
+        adv_note = (f"Tape advance set to {adv_mm} mm — remembered for "
+                    f"'{part}'.\n\n") if adv_src == "history" else ""
         messagebox.showinfo(
             "Feeder added",
             f"Added '{name}' (cloned from '{tmpl.name}').\n\n"
             f"{tape_note}"
+            f"{adv_note}"
             f"Backup saved to:\n{backup}",
         )
 
     def _on_motion(self, event):
         f = self._feeder_at(event.x, event.y)
         if f and self.selected is None:
-            self.detail.config(text=self._describe(f))
+            self._show_details(f)
 
     @staticmethod
-    def _describe(f: Feeder) -> str:
+    def _detail_rows(f: Feeder) -> list[tuple[str, str] | None]:
+        """The (key, value) rows for the detail panel; None = a group spacer."""
         part = f.part if f.part not in NO_PART else "— none —"
-        return (
-            f"Name   : {f.name}\n"
-            f"Status : {'ENABLED' if f.enabled else 'disabled'}\n"
-            f"Part   : {part}\n"
-            f"\n"
-            f"X      : {f.x:.2f} mm\n"
-            f"Y      : {f.y:.2f} mm\n"
-            f"Z      : {f.z:.2f} mm\n"
-            f"Rot    : {f.rotation:.2f}°\n"
-            f"In-feed: {f.rotation_in_feeder}\n"
-            f"Feeds  : {f.feed_count}\n"
-            f"\n"
-            f"id     : {f.fid}"
-        )
+        rot_in = f.rotation_in_feeder.strip()
+        tape_rot = f"{rot_in}°" if rot_in else "—"
+        adv_mm = advance_mm_from_actuator(f.post_pick_actuator)
+        advance = f"{adv_mm} mm" if adv_mm is not None else \
+            (f.post_pick_actuator or "—")
+        return [
+            ("Name", f.name),
+            ("Status", "ENABLED" if f.enabled else "disabled"),
+            ("Part", part),
+            None,
+            ("X", f"{f.x:.2f} mm"),
+            ("Y", f"{f.y:.2f} mm"),
+            ("Z", f"{f.z:.2f} mm"),
+            ("Rotation", f"{f.rotation:.2f}°"),
+            ("Tape rot.", tape_rot),
+            None,
+            ("Advance", advance),
+            ("Move feed", "yes" if f.move_before_feed else "no"),
+            ("Feeds", f.feed_count or "0"),
+            None,
+            ("id", f.fid),
+        ]
+
+    def _show_details(self, f: Feeder | None):
+        """Render a feeder (or the empty-state hint) into the detail grid.
+
+        Skips the rebuild when the same feeder is already shown, so hovering
+        doesn't thrash the widget tree on every mouse move."""
+        if f is self._detail_for:
+            return
+        self._detail_for = f
+        for w in self.detail.winfo_children():
+            w.destroy()
+        if f is None:
+            tk.Label(self.detail, text="Hover or click a feeder.",
+                     bg=self.COL_BED, fg=self.COL_TEXT, anchor="w",
+                     justify="left").grid(row=0, column=0, columnspan=2,
+                                          sticky="w")
+            return
+        keyfont = ("TkDefaultFont", 9)
+        for r, item in enumerate(self._detail_rows(f)):
+            if item is None:
+                tk.Frame(self.detail, bg=self.COL_BED, height=8).grid(row=r,
+                                                                      column=0)
+                continue
+            key, val = item
+            tk.Label(self.detail, text=key, bg=self.COL_BED, fg=self.COL_KEY,
+                     anchor="w", font=keyfont).grid(row=r, column=0, sticky="w",
+                                                    padx=(0, 12), pady=1)
+            tk.Label(self.detail, text=val, bg=self.COL_BED, fg=self.COL_TEXT,
+                     anchor="w", justify="left", font=self.mono,
+                     wraplength=190).grid(row=r, column=1, sticky="w", pady=1)
 
     def run(self):
         self.root.mainloop()
@@ -1266,7 +1437,13 @@ class AddFeederDialog(tk.Toplevel):
             tape_line = f"Tape : {tape_rot}°  (auto: 0603/0805 R/C)"
         else:
             tape_line = "Tape : (template default)"
+        adv_mm, adv_src = resolve_advance(part, self.app.advances)
+        if adv_src == "history":
+            adv_line = f"Adv  : {adv_mm} mm  (remembered)"
+        else:
+            adv_line = "Adv  : (template default)"
         warn = ("\n" + "\n".join(warns)) if warns else ""
+        act = actuator_value_for_name(name)
         self.preview.config(
             text=(f"Name : {name}\n"
                   f"X    : {x:.2f} mm\n"
@@ -1274,6 +1451,8 @@ class AddFeederDialog(tk.Toplevel):
                   f"Z    : {z:.2f} mm\n"
                   f"Rot  : {rot:.2f}°\n"
                   f"{tape_line}\n"
+                  f"{adv_line}\n"
+                  f"Act  : {act}  (feed + post-pick)\n"
                   f"clone: {model.template.name}{warn}"))
         self.add_btn.config(state="normal")
 
@@ -1301,231 +1480,210 @@ class AddFeederDialog(tk.Toplevel):
                             x, y, z, rot)
 
 
-class MoveFeederDialog(tk.Toplevel):
-    """Move an existing feeder onto a different bank/port preset."""
+class EditFeederDialog(tk.Toplevel):
+    """Edit every property of a feeder in one dialog (opened by double-click).
+
+    Slot, part, enabled, tape rotation, tape advance and move-before-feed are
+    all editable, and applied in a single backup + write. The position is only
+    rewritten if the slot (bank/port) is actually changed, so a feeder left on
+    its slot keeps its exact (possibly calibrated) x/y.
+    """
 
     PORTS = list(range(13))
+    ROT_PRESETS = ("-90", "0", "90", "180", "270")
 
     def __init__(self, app: "FeederMapApp", feeder: Feeder):
         super().__init__(app.root)
         self.app = app
         self.feeder = feeder
-        self.title("Move feeder")
+        self.title(f"Edit feeder — {feeder.name}")
         self.configure(bg=app.COL_BG)
         self.transient(app.root)
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(460, 0)
 
         pad = {"padx": 10, "pady": 5}
         frm = tk.Frame(self, bg=app.COL_BG)
         frm.pack(fill="both", expand=True, padx=8, pady=8)
+        frm.columnconfigure(1, weight=1)
 
-        tk.Label(frm, text=f"Moving '{feeder.name}'  (part: "
-                           f"{feeder.part if feeder.has_part else '—'})",
-                 bg=app.COL_BG, fg=app.COL_TEXT).grid(
-            row=0, column=0, columnspan=2, sticky="w", **pad)
+        def label(r, text, sticky="e"):
+            tk.Label(frm, text=text, bg=app.COL_BG, fg=app.COL_TEXT).grid(
+                row=r, column=0, sticky=sticky, **pad)
 
-        tk.Label(frm, text="To slot (bank)", bg=app.COL_BG, fg=app.COL_TEXT).grid(
-            row=1, column=0, sticky="e", **pad)
-        self.bank_var = tk.StringVar()
+        tk.Label(frm, text=f"id  {feeder.fid}", bg=app.COL_BG, fg=app.COL_KEY,
+                 font=app.small).grid(row=0, column=0, columnspan=2,
+                                      sticky="w", **pad)
+
+        # Slot (bank / port) — repositions only if changed
+        cur = parse_slot(feeder.name)
         banks = [str(b) for b in sorted(app.models)]
-        ttk.Combobox(frm, textvariable=self.bank_var, values=banks, width=10,
-                     state="readonly").grid(row=1, column=1, sticky="w", **pad)
+        self.has_slots = bool(banks)
+        label(1, "Slot (bank / port)")
+        slot_row = tk.Frame(frm, bg=app.COL_BG)
+        slot_row.grid(row=1, column=1, sticky="w", **pad)
+        if self.has_slots:
+            self.bank_var = tk.StringVar(
+                value=str(cur[0]) if cur and cur[0] in app.models else banks[0])
+            self.port_var = tk.StringVar(value=str(cur[1]) if cur else "0")
+            ttk.Combobox(slot_row, textvariable=self.bank_var, values=banks,
+                         width=6, state="readonly").pack(side="left")
+            tk.Label(slot_row, text=" / ", bg=app.COL_BG,
+                     fg=app.COL_TEXT).pack(side="left")
+            ttk.Combobox(slot_row, textvariable=self.port_var,
+                         values=[str(p) for p in self.PORTS], width=6,
+                         state="readonly").pack(side="left")
+            self._init_slot = (self.bank_var.get(), self.port_var.get())
+            self.bank_var.trace_add("write", lambda *_: self._update_preview())
+            self.port_var.trace_add("write", lambda *_: self._update_preview())
+        else:
+            self.bank_var = self.port_var = None
+            self._init_slot = (None, None)
+            tk.Label(slot_row, text="(no bank presets — position not editable)",
+                     bg=app.COL_BG, fg=app.COL_KEY).pack(side="left")
 
-        tk.Label(frm, text="To feeder (port)", bg=app.COL_BG, fg=app.COL_TEXT).grid(
-            row=2, column=0, sticky="e", **pad)
-        self.port_var = tk.StringVar()
-        ttk.Combobox(frm, textvariable=self.port_var,
-                     values=[str(p) for p in self.PORTS], width=10,
-                     state="readonly").grid(row=2, column=1, sticky="w", **pad)
+        # Part
+        tk.Label(frm, text="Part", bg=app.COL_BG, fg=app.COL_TEXT).grid(
+            row=2, column=0, sticky="ne", **pad)
+        parts = read_part_ids(app.config_path)
+        part_w = min(60, max(26, *(len(p) for p in parts))) if parts else 26
+        self.part_var = tk.StringVar(
+            value=feeder.part if feeder.has_part else "NC")
+        SearchableSelect(frm, app, parts, self.part_var, width=part_w,
+                         height=6).grid(row=2, column=1, sticky="we", **pad)
 
+        # Enabled
+        self.enabled_var = tk.BooleanVar(value=feeder.enabled)
+        tk.Checkbutton(frm, text="Enabled", variable=self.enabled_var,
+                       bg=app.COL_BG, fg=app.COL_TEXT, selectcolor=app.COL_BED,
+                       activebackground=app.COL_BG, activeforeground=app.COL_TEXT
+                       ).grid(row=3, column=1, sticky="w", **pad)
+
+        # Tape rotation
+        label(4, "Tape rotation (°)")
+        rot_row = tk.Frame(frm, bg=app.COL_BG)
+        rot_row.grid(row=4, column=1, sticky="w", **pad)
+        self.rot_var = tk.StringVar(value=feeder.rotation_in_feeder or "0")
+        ttk.Combobox(rot_row, textvariable=self.rot_var,
+                     values=self.ROT_PRESETS, width=10).pack(side="left")
+        tk.Button(rot_row, text="?", width=2,
+                  command=lambda: RotationHelpDialog(app, self)).pack(
+                      side="left", padx=(6, 0))
+
+        # Tape advance
+        label(5, "Tape advance")
+        self.adv_options = read_advance_actuators(app.config_path)
+        cur_mm = advance_mm_from_actuator(feeder.post_pick_actuator)
+        self.adv_var = tk.StringVar(
+            value=f"{cur_mm} mm" if cur_mm in self.adv_options
+            else (f"{self.adv_options[0]} mm" if self.adv_options else ""))
+        ttk.Combobox(frm, textvariable=self.adv_var, state="readonly",
+                     values=[f"{mm} mm" for mm in self.adv_options],
+                     width=10).grid(row=5, column=1, sticky="w", **pad)
+
+        # Move before feed
+        self.move_var = tk.BooleanVar(value=feeder.move_before_feed)
+        tk.Checkbutton(
+            frm, text="Move to feeder before feeding", variable=self.move_var,
+            bg=app.COL_BG, fg=app.COL_TEXT, selectcolor=app.COL_BED,
+            activebackground=app.COL_BG, activeforeground=app.COL_TEXT
+        ).grid(row=6, column=1, sticky="w", **pad)
+
+        # Position preview (only meaningful when the slot is changed)
         self.preview = tk.Label(frm, text="", bg=app.COL_BED, fg=app.COL_TEXT,
-                                justify="left", anchor="w", font=app.mono,
-                                width=40)
-        self.preview.grid(row=3, column=0, columnspan=2, sticky="we", **pad)
+                                justify="left", anchor="w", font=app.mono)
+        self.preview.grid(row=7, column=0, columnspan=2, sticky="we", **pad)
 
         btns = tk.Frame(frm, bg=app.COL_BG)
-        btns.grid(row=4, column=0, columnspan=2, sticky="e", **pad)
+        btns.grid(row=8, column=0, columnspan=2, sticky="e", **pad)
         tk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
-        self.move_btn = tk.Button(btns, text="Move", command=self._submit)
-        self.move_btn.pack(side="right", padx=(0, 8))
+        tk.Button(btns, text="Save", command=self._save).pack(
+            side="right", padx=(0, 8))
 
-        self.bank_var.trace_add("write", lambda *_: self._update_preview())
-        self.port_var.trace_add("write", lambda *_: self._update_preview())
         self.bind("<Escape>", lambda e: self.destroy())
-        # default to the feeder's current slot if its name encodes one
-        cur = parse_slot(feeder.name)
-        self.bank_var.set(str(cur[0]) if cur and cur[0] in app.models else banks[0])
-        self.port_var.set(str(cur[1]) if cur else "0")
+        self._update_preview()
         self.grab_set()
 
     def _selection(self):
         try:
             return int(self.bank_var.get()), int(self.port_var.get())
-        except ValueError:
+        except (ValueError, AttributeError):
             return None, None
+
+    def _will_reposition(self) -> bool:
+        return self.has_slots and \
+            (self.bank_var.get(), self.port_var.get()) != self._init_slot
 
     def _unreachable(self, x, y):
         xmin, ymin, xmax, ymax = self.app.bed
         return not (xmin <= x <= xmax and ymin <= y <= ymax)
 
     def _other_at(self, bank, port):
-        """A *different* feeder occupying the target slot, if any."""
+        """A *different* feeder already occupying the target slot, if any."""
         return next((f for f in self.app.feeders
                      if f.fid != self.feeder.fid
                      and parse_slot(f.name) == (bank, port)), None)
 
     def _update_preview(self):
+        if not self._will_reposition():
+            self.preview.config(text="Slot unchanged — position kept as-is.")
+            return
         bank, port = self._selection()
         if bank is None or bank not in self.app.models:
-            self.preview.config(text="select a target slot")
-            self.move_btn.config(state="disabled")
+            self.preview.config(text="select a valid slot")
             return
         x, y, z, rot = self.app.models[bank].position(port)
         name = slot_name(bank, port)
-        warns = []
-        if self._unreachable(x, y):
-            warns.append("⚠ outside machine travel — NOT reachable by the head.")
-        other = self._other_at(bank, port)
-        if other:
-            warns.append(f"⚠ slot already used by '{other.name}'.")
-        warn = ("\n" + "\n".join(warns)) if warns else ""
+        warn = "\n⚠ outside machine travel — NOT reachable." \
+            if self._unreachable(x, y) else ""
         self.preview.config(
-            text=(f"{self.feeder.name}  →  {name}\n"
-                  f"X    : {x:.2f} mm\n"
-                  f"Y    : {y:.2f} mm\n"
-                  f"Z    : {z:.2f} mm\n"
-                  f"Rot  : {rot:.2f}°{warn}"))
-        self.move_btn.config(state="normal")
+            text=(f"Will move to {name}\n"
+                  f"X : {x:.2f} mm   Y : {y:.2f} mm\n"
+                  f"Z : {z:.2f} mm   Rot : {rot:.2f}°{warn}"))
 
-    def _submit(self):
-        bank, port = self._selection()
-        if bank is None or bank not in self.app.models:
-            return
-        x, y, z, _ = self.app.models[bank].position(port)
-        name = slot_name(bank, port)
-        if self._unreachable(x, y) and not messagebox.askyesno(
-            "Not reachable",
-            f"{name} is at X={x:.1f} Y={y:.1f}, outside the machine travel — "
-            "the head cannot reach it.\n\nMove it there anyway?", parent=self):
-            return
-        other = self._other_at(bank, port)
-        if other and not messagebox.askyesno(
-            "Slot in use", f"Slot {bank}/{port} is already used by "
-                           f"'{other.name}'.\nMove '{self.feeder.name}' there "
-                           "anyway?", parent=self):
-            return
-        self.destroy()
-        self.app.move_feeder(self.feeder, bank, port)
-
-
-class ChangePartDialog(tk.Toplevel):
-    """Change the part associated with an existing feeder."""
-
-    def __init__(self, app: "FeederMapApp", feeder: Feeder):
-        super().__init__(app.root)
-        self.app = app
-        self.feeder = feeder
-        self.title("Set part")
-        self.configure(bg=app.COL_BG)
-        self.transient(app.root)
-        self.resizable(True, True)
-        self.minsize(440, 0)
-
-        pad = {"padx": 10, "pady": 8}
-        frm = tk.Frame(self, bg=app.COL_BG)
-        frm.pack(fill="both", expand=True, padx=8, pady=8)
-        frm.columnconfigure(1, weight=1)
-
-        tk.Label(frm, text=f"Feeder '{feeder.name}'", bg=app.COL_BG,
-                 fg=app.COL_TEXT).grid(row=0, column=0, columnspan=2,
-                                       sticky="w", **pad)
-        tk.Label(frm, text="Part", bg=app.COL_BG, fg=app.COL_TEXT).grid(
-            row=1, column=0, sticky="ne", **pad)
-
-        parts = read_part_ids(app.config_path)
-        part_w = min(60, max(26, *(len(p) for p in parts))) if parts else 26
-        self.part_var = tk.StringVar(value=feeder.part if feeder.has_part else "NC")
-        sel = SearchableSelect(frm, app, parts, self.part_var, width=part_w)
-        sel.grid(row=1, column=1, sticky="we", **pad)
-        sel.entry.focus_set()
-
-        btns = tk.Frame(frm, bg=app.COL_BG)
-        btns.grid(row=2, column=0, columnspan=2, sticky="e", **pad)
-        tk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
-        tk.Button(btns, text="Set", command=self._submit).pack(
-            side="right", padx=(0, 8))
-
-        self.bind("<Return>", lambda e: self._submit())
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
-
-    def _submit(self):
-        part = self.part_var.get()
-        self.destroy()
-        self.app.change_part(self.feeder, part)
-
-
-class ChangeRotationDialog(tk.Toplevel):
-    """Change the tape rotation (rotation-in-feeder) of an existing feeder."""
-
-    PRESETS = ("-90", "0", "90", "180", "270")
-
-    def __init__(self, app: "FeederMapApp", feeder: Feeder):
-        super().__init__(app.root)
-        self.app = app
-        self.feeder = feeder
-        self.title("Set tape rotation")
-        self.configure(bg=app.COL_BG)
-        self.transient(app.root)
-        self.resizable(False, False)
-
-        pad = {"padx": 10, "pady": 8}
-        frm = tk.Frame(self, bg=app.COL_BG)
-        frm.pack(fill="both", expand=True, padx=8, pady=8)
-        frm.columnconfigure(1, weight=1)
-
-        tk.Label(frm, text=f"Feeder '{feeder.name}'", bg=app.COL_BG,
-                 fg=app.COL_TEXT).grid(row=0, column=0, columnspan=2,
-                                       sticky="w", **pad)
-        tk.Label(frm, text=f"Current : {feeder.rotation_in_feeder}°",
-                 bg=app.COL_BG, fg=app.COL_TEXT).grid(
-            row=1, column=0, columnspan=2, sticky="w", **pad)
-
-        tk.Label(frm, text="Tape rotation (°)", bg=app.COL_BG,
-                 fg=app.COL_TEXT).grid(row=2, column=0, sticky="e", **pad)
-        row = tk.Frame(frm, bg=app.COL_BG)
-        row.grid(row=2, column=1, sticky="w", **pad)
-        self.rot_var = tk.StringVar(value=feeder.rotation_in_feeder or "0")
-        cb = ttk.Combobox(row, textvariable=self.rot_var,
-                          values=self.PRESETS, width=12)
-        cb.pack(side="left")
-        tk.Button(row, text="?", width=2,
-                  command=lambda: RotationHelpDialog(app, self)).pack(
-                      side="left", padx=(6, 0))
-        cb.focus_set()
-
-        btns = tk.Frame(frm, bg=app.COL_BG)
-        btns.grid(row=3, column=0, columnspan=2, sticky="e", **pad)
-        tk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
-        tk.Button(btns, text="Set", command=self._submit).pack(
-            side="right", padx=(0, 8))
-
-        self.bind("<Return>", lambda e: self._submit())
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
-
-    def _submit(self):
-        raw = self.rot_var.get().strip()
+    def _save(self):
+        raw_rot = self.rot_var.get().strip()
         try:
-            value = float(raw)
+            rotation = float(raw_rot)
         except ValueError:
             messagebox.showerror(
                 "Invalid value",
-                f"'{raw}' is not a number. Enter a rotation in degrees "
-                "(e.g. 0, 90, 180, 270).", parent=self)
+                f"Tape rotation '{raw_rot}' is not a number.", parent=self)
             return
+        m = re.match(r"\s*(\d+)", self.adv_var.get())
+        if not m:
+            messagebox.showerror(
+                "Invalid value", "Pick a tape advance.", parent=self)
+            return
+        advance_mm = int(m.group(1))
+
+        reposition = self._will_reposition()
+        bank, port = self._selection()
+        if reposition:
+            if bank is None or bank not in self.app.models:
+                messagebox.showerror(
+                    "Invalid slot", "Select a valid slot.", parent=self)
+                return
+            x, y, _, _ = self.app.models[bank].position(port)
+            if self._unreachable(x, y) and not messagebox.askyesno(
+                "Not reachable",
+                f"Slot {bank}/{port} is at X={x:.1f} Y={y:.1f}, outside the "
+                "machine travel.\n\nMove it there anyway?", parent=self):
+                return
+            other = self._other_at(bank, port)
+            if other and not messagebox.askyesno(
+                "Slot in use",
+                f"Slot {bank}/{port} is already used by '{other.name}'.\n"
+                f"Move '{self.feeder.name}' there anyway?", parent=self):
+                return
+
+        part = self.part_var.get().strip() or "NC"
         self.destroy()
-        self.app.change_rotation_in_feeder(self.feeder, value)
+        self.app.edit_feeder(
+            self.feeder, reposition=reposition, bank=bank or 0, port=port or 0,
+            part=part, enabled=self.enabled_var.get(),
+            rotation_in_feeder=rotation, advance_mm=advance_mm,
+            move_before_feed=self.move_var.get())
 
 
 class RotationHelpDialog(tk.Toplevel):
